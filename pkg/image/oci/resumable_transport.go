@@ -51,14 +51,23 @@ const (
 	// a body that is arriving slowly is never on a clock.
 	reopenHeaderTimeout = 30 * time.Second
 
-	// firstByteTimeout is the budget for the first read of an attempt, which is a different thing
-	// from the silence readStallTimeout bounds. a response can legitimately carry its headers and
-	// Content-Length well before its first body byte -- a pull-through cache or a scanning proxy
-	// answers from upstream metadata and only then fetches the object -- and holding that to the
-	// mid-body budget would fail a pull that previously merely ran slowly. it is generous because
-	// it is not the case this transport was written for: nothing observed stalls before the first
-	// byte, and the bound exists so that such a server is still bounded, not so that it is punished.
-	firstByteTimeout = 2 * time.Minute
+	// firstByteTimeout is the budget for the very first byte of a transfer, which is a different
+	// thing from the silence readStallTimeout bounds. a response can legitimately carry its headers
+	// and Content-Length well before its first body byte -- a pull-through cache answers from
+	// upstream metadata and only then fetches from origin -- and holding a cold start to the
+	// mid-body budget would fail a pull that previously merely ran slowly.
+	//
+	// it covers the opening request only, not every attempt. a reopen goes to a host that has just
+	// demonstrated it has the object positioned and streaming, and reopenHeaderTimeout already
+	// bounds it reaching that point, so a resumed segment that then says nothing is silence rather
+	// than cold start. that distinction is what keeps the worst case bounded: were this spent on
+	// each of maxTotalResumes attempts, a server that trickles just enough to replenish the stall
+	// budget and then goes quiet could hold a pull for the better part of an hour.
+	//
+	// these products run on servers and corporate estates, where a minute of silence before the
+	// first byte means something is actually broken rather than merely slow, so the budget is sized
+	// to tolerate a cold start once and not to wait out an outage.
+	firstByteTimeout = time.Minute
 
 	// readStallTimeout bounds how long a single read may wait for bytes that never come. an
 	// unhealthy CDN edge does not close the connection when it stops serving a body: it simply goes
@@ -67,7 +76,7 @@ const (
 	// server and nothing covers the transfer, so without this the resume machinery cannot learn that
 	// anything is wrong until the peer decides to tell it.
 	//
-	// it applies once the attempt has delivered a byte; until then firstByteTimeout does. it is
+	// it applies once the transfer has delivered a byte; until then firstByteTimeout does. it is
 	// armed around a single Read and disarmed the moment that Read returns, so it measures the
 	// server's silence while we are actually waiting on it and never the caller's own think time.
 	// that distinction is the point rather than an optimisation: the truncation this recovers from
@@ -276,9 +285,9 @@ type resumableBody struct {
 	// the remainder belong to the reader and are not guarded: io.Reader admits a single reader
 	offset   int64
 	progress int64
-	// delivered records whether the current attempt has produced a byte, which selects between the
-	// first-byte budget and the mid-body one. reset on every resume, so each attempt earns its own
-	// grace rather than inheriting the previous one's
+	// delivered records whether the transfer has produced a byte, which selects between the
+	// first-byte budget and the mid-body one. it is never reset: the generous budget is for a cold
+	// start, and a transfer only starts cold once
 	delivered bool
 	stalls    int
 	resumes   int
@@ -337,13 +346,13 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 // interrupted: every read that delivers bytes arms a fresh one, and a caller that stops reading is
 // not on a clock at all.
 func (b *resumableBody) readWithDeadline(body io.Reader, p []byte) (int, error) {
-	timeout := b.stallTimeout
-	if !b.delivered {
-		timeout = b.firstByte
+	if b.stallTimeout <= 0 {
+		return body.Read(p)
 	}
 
-	if timeout <= 0 {
-		return body.Read(p)
+	timeout := b.stallTimeout
+	if !b.delivered && b.firstByte > 0 {
+		timeout = b.firstByte
 	}
 
 	// the cancel is captured here and handed to the watchdog rather than read from the struct when
@@ -462,7 +471,6 @@ func (b *resumableBody) finished() (bool, error) {
 // until it succeeds or runs out of budget.
 func (b *resumableBody) resume(cause error) error {
 	b.closeCurrent()
-	b.delivered = false
 
 	for {
 		b.resumes++
@@ -501,7 +509,11 @@ func (b *resumableBody) resume(cause error) error {
 					forLog(b.req.URL), b.offset, cause, err)
 			}
 
-			cause = err
+			// the same renaming the read error gets, and for the same reason: http.Transport hands
+			// back a bare io.EOF when a peer accepts the connection, reads the request and closes
+			// without answering -- which is precisely what a drained CDN edge does, and is how this
+			// path is reached at all
+			cause = shortRead(err)
 
 			continue
 		}
@@ -590,9 +602,13 @@ func (b *resumableBody) reopen() (io.ReadCloser, error) {
 	// stopped once headers arrive, so the clock is on reaching the server rather than on the
 	// transfer that follows. a timer that fires in the instant before Stop costs one attempt of the
 	// budget, which is why this is not the only thing bounding the read
-	headers := time.AfterFunc(b.headerTimeout, cancel)
+	var headers *time.Timer
+	if b.headerTimeout > 0 {
+		headers = time.AfterFunc(b.headerTimeout, cancel)
+	}
+
 	resp, err := b.base.RoundTrip(req)
-	timedOut := !headers.Stop()
+	timedOut := headers != nil && !headers.Stop()
 
 	if err != nil {
 		if timedOut {
@@ -670,15 +686,37 @@ func (b *resumableBody) acceptable(resp *http.Response) (io.ReadCloser, error) {
 			errNoRangeSupport, start, b.offset))
 	}
 
-	// a server that ignored the Range and began the object again, while still echoing back the
-	// range it was asked for, contradicts itself here: the body it declares is longer than the
-	// span it claims to be sending. it cannot catch a server whose lengths agree and whose bytes
-	// are simply wrong -- only the digest above can do that -- but it is the shape a server with
-	// no real range support actually takes, and catching it here costs one request instead of a
-	// whole layer
-	if span := end - start + 1; end >= start && resp.ContentLength >= 0 && resp.ContentLength != span {
-		return reject(fmt.Errorf("%w: Content-Range covers %d bytes but %d were sent",
-			errNoRangeSupport, span, resp.ContentLength))
+	// RFC 9110 requires a 206 to give a last byte position, and either a complete length or "*". a
+	// Content-Range carrying neither is malformed, and it is the one combination that switches off
+	// both the span check below and the changed-object check after it at once, leaving the start
+	// offset as the only thing between us and a body of the right length and the wrong bytes.
+	// tolerating the leniencies separately is deliberate; tolerating both at once is not
+	if end < 0 && total < 0 {
+		return reject(fmt.Errorf("%w: Content-Range gives neither a last byte position nor a total",
+			errNoRangeSupport))
+	}
+
+	if end >= 0 {
+		if end < start {
+			return reject(fmt.Errorf("%w: Content-Range ends at byte %d, before the byte %d it starts at",
+				errNoRangeSupport, end, start))
+		}
+
+		if end > b.total-1 {
+			return reject(fmt.Errorf("%w: Content-Range ends at byte %d, past the last byte of a %d byte object",
+				errNoRangeSupport, end, b.total))
+		}
+
+		// a server that ignored the Range and began the object again, while still echoing back the
+		// range it was asked for, contradicts itself here: the body it declares is longer than the
+		// span it claims to be sending. it cannot catch a server whose lengths agree and whose bytes
+		// are simply wrong -- only the digest above can do that -- but it is the shape a server with
+		// no real range support actually takes, and catching it here costs one request instead of a
+		// whole layer
+		if span := end - start + 1; resp.ContentLength >= 0 && resp.ContentLength != span {
+			return reject(fmt.Errorf("%w: Content-Range covers %d bytes but %d were sent",
+				errNoRangeSupport, span, resp.ContentLength))
+		}
 	}
 
 	if total >= 0 && total != b.total {

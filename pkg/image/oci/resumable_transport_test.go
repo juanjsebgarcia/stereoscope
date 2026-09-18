@@ -1,9 +1,11 @@
 package oci
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -884,6 +886,15 @@ func TestResumableTransport_shouldResume(t *testing.T) {
 			expected: true,
 		},
 		{
+			// http.Transport never returns (nil, nil), but newResumableTransport takes any
+			// RoundTripper, and a base that broke the contract used to panic here rather than
+			// simply not being wrapped
+			name:     "a nil response is left alone",
+			req:      get(""),
+			resp:     nil,
+			expected: false,
+		},
+		{
 			// the offsets are wire bytes, so an identity segment cannot be spliced onto a stream
 			// that arrived in some coding. net/http leaves an explicit one from the server in place
 			name:     "an encoded response is left alone",
@@ -1289,13 +1300,16 @@ func TestResumableTransport_leavesASlowButAdvancingBodyAlone(t *testing.T) {
 	// guards the constant against being read as a clock on slowness: this body takes far longer than
 	// the stall timeout to arrive in total, but is never silent for as long as one
 	payload := payloadOfSize(32 * 1024)
-	server := &pacedBlobServer{payload: payload, writes: 16, gap: 10 * time.Millisecond}
+	server := &pacedBlobServer{payload: payload, writes: 16, gap: 5 * time.Millisecond}
 
 	srv := httptest.NewServer(server)
 	t.Cleanup(srv.Close)
 
 	transport := newTestTransport(1)
-	transport.stallTimeout = 50 * time.Millisecond
+	// a hundredfold margin rather than a fivefold one: at 5x, scheduling noise under -race fired the
+	// watchdog about once in ninety runs, and the resume then met a fixture that ignores Range and
+	// failed the test outright. what is being asserted is the ratio, so the absolute values are free
+	transport.stallTimeout = 500 * time.Millisecond
 
 	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
 	require.NoError(t, err)
@@ -1309,8 +1323,8 @@ func TestResumableTransport_leavesASlowButAdvancingBodyAlone(t *testing.T) {
 }
 
 func TestResumableTransport_stallDeadlineIsOffWhenUnset(t *testing.T) {
-	// the zero value has to mean "no watchdog", since every existing test builds a transport without
-	// one and a body that simply takes its time must not be torn down
+	// the zero value of stallTimeout is the master switch: it turns off the first-byte budget with
+	// it, so a caller that wants no watchdog at all gets none rather than a two-minute one
 	payload := payloadOfSize(8192)
 	server := &flakyBlobServer{payload: payload, dropsLeft: 1, bytesPerDrop: 1000}
 
@@ -1487,24 +1501,35 @@ func TestResumableTransport_stillBoundsAFirstByteThatNeverArrives(t *testing.T) 
 	t.Cleanup(func() { close(server.release); srv.Close() })
 
 	transport := newTestTransport(1)
+	// only the first-byte budget is short: were the read governed by the mid-body one instead, this
+	// would wait five seconds and the select below would fire, so the test pins the field it names
 	transport.firstByte = 50 * time.Millisecond
-	transport.stallTimeout = 50 * time.Millisecond
+	transport.stallTimeout = 5 * time.Second
 
 	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = resp.Body.Close() })
 
-	done := make(chan error, 1)
+	type result struct {
+		body []byte
+		err  error
+	}
+
+	done := make(chan result, 1)
 	go func() {
-		_, readErr := io.ReadAll(resp.Body)
-		done <- readErr
+		body, readErr := io.ReadAll(resp.Body)
+		done <- result{body: body, err: readErr}
 	}()
 
 	select {
-	case readErr := <-done:
-		// the second attempt is served in full by this fixture, so the read succeeds -- what is
-		// being asserted is that it returned at all rather than waiting on the first attempt
-		assert.NoError(t, readErr)
+	case got := <-done:
+		// the second attempt is served in full by this fixture, so the read succeeds. the body is
+		// compared rather than discarded, so a resume that bounded the wait and then spliced the
+		// wrong bytes would not pass for a fix
+		require.NoError(t, got.err)
+		assert.Equal(t, payload, got.body)
+		assert.Equal(t, []string{"", "bytes=0-32767"}, server.seenRanges(),
+			"the resume should ask for the whole object, none of it having arrived")
 	case <-time.After(10 * time.Second):
 		t.Fatal("a first byte that never arrived was never bounded")
 	}
@@ -1570,5 +1595,142 @@ func TestResumableTransport_boundsAReopenThatNeverSendsHeaders(t *testing.T) {
 			"our own timer must not reach the caller as a cancellation nobody asked for")
 	case <-time.After(30 * time.Second):
 		t.Fatal("a reopen that never sent headers was never bounded")
+	}
+}
+
+// acceptAndCloseListener serves one truncated blob over a raw socket and then answers every later
+// connection by reading the request and closing without a response. That is what a load balancer
+// or CDN edge whose backend pool has drained does, and net/http reports it to the caller of
+// RoundTrip as a bare io.EOF -- the second door into the terminal error, which httptest cannot
+// produce because it always writes a response.
+type acceptAndCloseListener struct {
+	listener net.Listener
+	payload  []byte
+	prefix   int
+
+	mu       sync.Mutex
+	attempts int
+}
+
+func newAcceptAndCloseListener(t *testing.T, payload []byte, prefix int) *acceptAndCloseListener {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	server := &acceptAndCloseListener{listener: listener, payload: payload, prefix: prefix}
+	go server.serve()
+
+	t.Cleanup(func() { _ = listener.Close() })
+
+	return server
+}
+
+func (s *acceptAndCloseListener) url() string {
+	return "http://" + s.listener.Addr().String() + "/blob"
+}
+
+func (s *acceptAndCloseListener) serve() {
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			return
+		}
+
+		go s.handle(conn)
+	}
+}
+
+func (s *acceptAndCloseListener) handle(conn net.Conn) {
+	defer conn.Close()
+
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	s.mu.Unlock()
+
+	// read the request line and headers, so the client has genuinely written its request
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil || line == "\r\n" {
+			break
+		}
+	}
+
+	if attempt > 1 {
+		// accept, read, and close with no response at all
+		return
+	}
+
+	fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", len(s.payload))
+	_, _ = conn.Write(s.payload[:s.prefix])
+}
+
+func TestResumableTransport_aReopenThatIsNeverAnsweredIsNotACleanEndOfStream(t *testing.T) {
+	// the sibling of aFailedTransferIsNeverACleanEndOfStream, and the door it does not cover: there
+	// the io.EOF comes from the body read, here it comes from RoundTrip itself. the invariant is the
+	// same and has to hold on both, or a caller testing errors.Is(err, io.EOF) reads a layer we
+	// failed to fetch as one that simply ended
+	payload := payloadOfSize(64 * 1024)
+	server := newAcceptAndCloseListener(t, payload, 1024)
+
+	transport := newTestTransport(1)
+	transport.headerTimeout = time.Second
+
+	resp, err := (&http.Client{Transport: transport}).Get(server.url())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	got, err := io.ReadAll(resp.Body)
+	require.Error(t, err, "a transfer whose every reopen goes unanswered must fail")
+
+	assert.Len(t, got, 1024, "the bytes that did arrive should still be handed over")
+	assert.NotErrorIs(t, err, io.EOF,
+		"a reopen that was never answered must not be mistakable for a clean end of stream")
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF,
+		"it should be reported as the short read it is")
+}
+
+func TestResumableTransport_endsAReadThatStallsOverHTTP2(t *testing.T) {
+	// the stall arrives through a different path in net/http on HTTP/2 than on HTTP/1.1, and every
+	// registry in the probe table serves HTTP/2. the suite had an HTTP/2 drop test but no stall one
+	payload := payloadOfSize(64 * 1024)
+	server := &stallingBlobServer{payload: payload, stallAfter: 1024, release: make(chan struct{})}
+
+	srv := httptest.NewUnstartedServer(server)
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(func() { close(server.release); srv.Close() })
+
+	transport := newResumableTransport(srv.Client().Transport)
+	transport.minSize = 1
+	transport.backoff = 0
+	transport.stallTimeout = 100 * time.Millisecond
+	transport.firstByte = 100 * time.Millisecond
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	require.Equal(t, "HTTP/2.0", resp.Proto, "the fixture must actually be serving HTTP/2")
+
+	type result struct {
+		body []byte
+		err  error
+	}
+
+	done := make(chan result, 1)
+	go func() {
+		body, readErr := io.ReadAll(resp.Body)
+		done <- result{body: body, err: readErr}
+	}()
+
+	select {
+	case got := <-done:
+		require.NoError(t, got.err)
+		assert.Equal(t, payload, got.body)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the watchdog never ended the stalled HTTP/2 read")
 	}
 }
