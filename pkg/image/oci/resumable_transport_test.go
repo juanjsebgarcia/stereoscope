@@ -1335,14 +1335,13 @@ func TestResumableTransport_stallDeadlineIsOffWhenUnset(t *testing.T) {
 	// test fails the moment that budget is armed at all -- which is what an earlier version of it
 	// could not do, since its server answered instantly and no budget was ever reached
 	payload := payloadOfSize(8192)
-	server := &pausingBlobServer{payload: payload, pause: 200 * time.Millisecond}
+	server := &pausingBlobServer{payload: payload, prefix: 512, pause: 200 * time.Millisecond}
 
 	srv := httptest.NewServer(server)
 	t.Cleanup(srv.Close)
 
 	transport := newTestTransport(1)
 	transport.stallTimeout = 0
-	transport.firstByte = time.Millisecond
 
 	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
 	require.NoError(t, err)
@@ -1454,6 +1453,9 @@ func TestResumableTransport_aFailedTransferIsNeverACleanEndOfStream(t *testing.T
 type pausingBlobServer struct {
 	payload []byte
 	pause   time.Duration
+	// prefix is delivered before the pause, so the pause is silence in the middle of a body rather
+	// than a slow start -- which is the only thing the watchdog bounds
+	prefix int
 
 	mu       sync.Mutex
 	attempts int
@@ -1466,11 +1468,16 @@ func (s *pausingBlobServer) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 
 	w.Header().Set("Content-Length", strconv.Itoa(len(s.payload)))
 	w.WriteHeader(http.StatusOK)
+
+	if s.prefix > 0 {
+		_, _ = w.Write(s.payload[:s.prefix])
+	}
+
 	w.(http.Flusher).Flush()
 
 	time.Sleep(s.pause)
 
-	_, _ = w.Write(s.payload)
+	_, _ = w.Write(s.payload[s.prefix:])
 }
 
 func (s *pausingBlobServer) attemptCount() int {
@@ -1479,9 +1486,11 @@ func (s *pausingBlobServer) attemptCount() int {
 	return s.attempts
 }
 
-func TestResumableTransport_allowsAGenerousFirstByte(t *testing.T) {
-	// time to first byte is a different thing from going quiet mid-body, and holding it to the
-	// mid-body budget would fail a pull that previously only ran slowly
+func TestResumableTransport_waitsForASlowFirstByteRatherThanBoundingIt(t *testing.T) {
+	// a slow start is not a stall. bounding it fails a pull that would have succeeded, and fails it
+	// hard: nothing has been delivered, so nothing replenishes the stall budget, and every attempt
+	// is a full restart that makes the server's own fetch begin again. the pause here is many times
+	// the mid-body budget, and must be waited out rather than resumed around
 	payload := payloadOfSize(32 * 1024)
 	server := &pausingBlobServer{payload: payload, pause: 150 * time.Millisecond}
 
@@ -1489,8 +1498,7 @@ func TestResumableTransport_allowsAGenerousFirstByte(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	transport := newTestTransport(1)
-	transport.stallTimeout = 20 * time.Millisecond
-	transport.firstByte = 5 * time.Second
+	transport.stallTimeout = 5 * time.Millisecond
 
 	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
 	require.NoError(t, err)
@@ -1502,51 +1510,6 @@ func TestResumableTransport_allowsAGenerousFirstByte(t *testing.T) {
 	assert.Equal(t, payload, got)
 	assert.Equal(t, 1, server.attemptCount(),
 		"a slow first byte should be waited for, not resumed around")
-}
-
-func TestResumableTransport_stillBoundsAFirstByteThatNeverArrives(t *testing.T) {
-	// the generous budget is still a budget: a server that sends headers and then nothing must not
-	// hold the reader for as long as the caller's context allows
-	payload := payloadOfSize(32 * 1024)
-	server := &stallingBlobServer{payload: payload, stallAfter: 0, release: make(chan struct{})}
-
-	srv := httptest.NewServer(server)
-	t.Cleanup(func() { close(server.release); srv.Close() })
-
-	transport := newTestTransport(1)
-	// only the first-byte budget is short, and the mid-body one is set well beyond the guard below,
-	// so a read governed by the wrong field never returns and the select fires. an earlier version
-	// used five seconds here, inside the guard, and so passed whichever field was consulted
-	transport.firstByte = 50 * time.Millisecond
-	transport.stallTimeout = 30 * time.Second
-
-	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = resp.Body.Close() })
-
-	type result struct {
-		body []byte
-		err  error
-	}
-
-	done := make(chan result, 1)
-	go func() {
-		body, readErr := io.ReadAll(resp.Body)
-		done <- result{body: body, err: readErr}
-	}()
-
-	select {
-	case got := <-done:
-		// the second attempt is served in full by this fixture, so the read succeeds. the body is
-		// compared rather than discarded, so a resume that bounded the wait and then spliced the
-		// wrong bytes would not pass for a fix
-		require.NoError(t, got.err)
-		assert.Equal(t, payload, got.body)
-		assert.Equal(t, []string{"", ""}, server.seenRanges(),
-			"with nothing delivered there is no prefix to splice onto, so the restart carries no Range")
-	case <-time.After(10 * time.Second):
-		t.Fatal("a first byte that never arrived was never bounded")
-	}
 }
 
 // silentReopenServer serves a prefix and drops, then accepts every later connection without ever
@@ -1721,7 +1684,6 @@ func TestResumableTransport_endsAReadThatStallsOverHTTP2(t *testing.T) {
 	transport.minSize = 1
 	transport.backoff = 0
 	transport.stallTimeout = 100 * time.Millisecond
-	transport.firstByte = 100 * time.Millisecond
 
 	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
 	require.NoError(t, err)
@@ -1858,6 +1820,10 @@ func (s *perpetuallyStallingServer) ServeHTTP(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("Content-Length", strconv.Itoa(length))
 	w.WriteHeader(status)
+
+	// a byte first: silence before the first byte is slowness, not a stall, and is deliberately
+	// not bounded. what is bounded is a body that starts and then stops
+	_, _ = w.Write(s.payload[:1])
 	w.(http.Flusher).Flush()
 	<-s.release
 }
@@ -1874,7 +1840,6 @@ func TestResumableTransport_aStallIsReportedAsAStall(t *testing.T) {
 
 	transport := newTestTransport(1)
 	transport.stallTimeout = 20 * time.Millisecond
-	transport.firstByte = 20 * time.Millisecond
 
 	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
 	require.NoError(t, err)
@@ -2007,7 +1972,6 @@ func TestResumableTransport_refusesAnUncheckableOrImpossibleContentRange(t *test
 // whole object and no regard for any Range header -- a server with no range support at all.
 type noRangeServer struct {
 	payload []byte
-	release chan struct{}
 	// restartLength, when set, is the length the restart declares and delivers instead of the whole
 	// object; restartCoding, when set, is a Content-Encoding it claims for the restarted body
 	restartLength int
@@ -2039,8 +2003,9 @@ func (s *noRangeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.(http.Flusher).Flush()
 
 	if first {
-		<-s.release
-		return
+		// headers, then the connection dies before a single body byte: the wrapper is left at
+		// offset zero with nothing to splice onto, which is what the restart path exists for
+		panic(http.ErrAbortHandler)
 	}
 
 	_, _ = w.Write(body)
@@ -2057,14 +2022,12 @@ func TestResumableTransport_restartsRatherThanRangesWhenNothingHasArrived(t *tes
 	// there is no prefix to splice onto -- while letting a server with no range support answer 200
 	// and be classified as permanently unable to resume, failing a layer that would have arrived
 	payload := payloadOfSize(64 * 1024)
-	server := &noRangeServer{payload: payload, release: make(chan struct{})}
+	server := &noRangeServer{payload: payload}
 
 	srv := httptest.NewServer(server)
-	t.Cleanup(func() { close(server.release); srv.Close() })
+	t.Cleanup(srv.Close)
 
 	transport := newTestTransport(1)
-	transport.firstByte = 50 * time.Millisecond
-	transport.stallTimeout = 30 * time.Second
 
 	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
 	require.NoError(t, err)
@@ -2113,20 +2076,20 @@ func TestResumableTransport_checksTheRestartedBodyItAccepts(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		server   func(chan struct{}) *noRangeServer
+		server   func() *noRangeServer
 		expected error
 	}{
 		{
 			name: "a restart of a different length is refused",
-			server: func(release chan struct{}) *noRangeServer {
-				return &noRangeServer{payload: payload, release: release, restartLength: len(payload) / 2}
+			server: func() *noRangeServer {
+				return &noRangeServer{payload: payload, restartLength: len(payload) / 2}
 			},
 			expected: errObjectChanged,
 		},
 		{
 			name: "a restart in a different coding is refused",
-			server: func(release chan struct{}) *noRangeServer {
-				return &noRangeServer{payload: payload, release: release, restartCoding: "gzip"}
+			server: func() *noRangeServer {
+				return &noRangeServer{payload: payload, restartCoding: "gzip"}
 			},
 			expected: errNoRangeSupport,
 		},
@@ -2134,15 +2097,12 @@ func TestResumableTransport_checksTheRestartedBodyItAccepts(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			release := make(chan struct{})
-			server := test.server(release)
+			server := test.server()
 
 			srv := httptest.NewServer(server)
-			t.Cleanup(func() { close(release); srv.Close() })
+			t.Cleanup(srv.Close)
 
 			transport := newTestTransport(1)
-			transport.firstByte = 50 * time.Millisecond
-			transport.stallTimeout = 30 * time.Second
 
 			resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
 			require.NoError(t, err)

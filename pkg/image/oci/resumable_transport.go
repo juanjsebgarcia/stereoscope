@@ -51,25 +51,6 @@ const (
 	// a body that is arriving slowly is never on a clock.
 	reopenHeaderTimeout = 30 * time.Second
 
-	// firstByteTimeout is the budget for the very first byte of a transfer, which is a different
-	// thing from the silence readStallTimeout bounds. a response can legitimately carry its headers
-	// and Content-Length well before its first body byte -- a pull-through cache answers from
-	// upstream metadata and only then fetches from origin -- and holding a cold start to the
-	// mid-body budget would fail a pull that previously merely ran slowly.
-	//
-	// it covers the transfer until its first byte rather than each attempt separately, in the sense
-	// that it stops applying for good once anything arrives -- though while nothing has, each
-	// attempt does arm its own, so a transfer that never starts can spend it maxConsecutiveStalls
-	// times over. a reopen that has delivered something goes to a host that has just
-	// demonstrated it has the object positioned and streaming, so silence after that is silence
-	// rather than cold start. a run of cold starts is bounded by maxConsecutiveStalls, since none of
-	// them delivers anything to replenish the budget.
-	//
-	// these products run on servers and corporate estates, where a minute of silence before the
-	// first byte means something is actually broken rather than merely slow, so the budget is sized
-	// to tolerate a cold start once and not to wait out an outage.
-	firstByteTimeout = time.Minute
-
 	// readStallTimeout bounds how long a single read may wait for bytes that never come. an
 	// unhealthy CDN edge does not close the connection when it stops serving a body: it simply goes
 	// quiet, and the read blocks until the peer eventually errors, which measured around two minutes
@@ -77,8 +58,15 @@ const (
 	// server and nothing covers the transfer, so without this the resume machinery cannot learn that
 	// anything is wrong until the peer decides to tell it.
 	//
-	// it applies once the transfer has delivered a byte; until then firstByteTimeout does. it is
-	// armed around a single Read and disarmed the moment that Read returns, so it measures the
+	// it applies only once the transfer has delivered a byte. before that nothing is on a clock at
+	// all: a server that sends its headers and then takes its time over the first byte -- a
+	// pull-through cache answering from upstream metadata before it has fetched from origin -- is
+	// slow rather than wedged, and an earlier revision that bounded it turned such a pull into six
+	// full restarts and a permanent failure. nothing had been delivered, so nothing replenished the
+	// stall budget, and each restart made the origin fetch begin again. a transfer that never starts
+	// is therefore bounded by the caller's context, exactly as it was before this transport existed.
+	//
+	// it is armed around a single Read and disarmed the moment that Read returns, so it measures the
 	// server's silence while we are actually waiting on it and never the caller's own think time.
 	// that distinction is the point rather than an optimisation: the truncation this recovers from
 	// is provoked by consuming slowly, so a clock over the transfer as a whole would abandon exactly
@@ -145,7 +133,6 @@ type resumableTransport struct {
 	minProgress   int64
 	backoff       time.Duration
 	stallTimeout  time.Duration
-	firstByte     time.Duration
 	headerTimeout time.Duration
 	maxStalls     int
 	maxResumes    int
@@ -162,7 +149,6 @@ func newResumableTransport(base http.RoundTripper) *resumableTransport {
 		minProgress:   minResumeProgress,
 		backoff:       stallBackoff,
 		stallTimeout:  readStallTimeout,
-		firstByte:     firstByteTimeout,
 		headerTimeout: reopenHeaderTimeout,
 		maxStalls:     maxConsecutiveStalls,
 		maxResumes:    maxTotalResumes,
@@ -191,7 +177,6 @@ func (t *resumableTransport) RoundTrip(req *http.Request) (*http.Response, error
 		minProgress:   t.minProgress,
 		backoff:       t.backoff,
 		stallTimeout:  t.stallTimeout,
-		firstByte:     t.firstByte,
 		headerTimeout: t.headerTimeout,
 		maxStalls:     t.maxStalls,
 		maxResumes:    t.maxResumes,
@@ -262,7 +247,6 @@ type resumableBody struct {
 	minProgress   int64
 	backoff       time.Duration
 	stallTimeout  time.Duration
-	firstByte     time.Duration
 	headerTimeout time.Duration
 	maxStalls     int
 	maxResumes    int
@@ -286,9 +270,8 @@ type resumableBody struct {
 	// the remainder belong to the reader and are not guarded: io.Reader admits a single reader
 	offset   int64
 	progress int64
-	// delivered records whether the transfer has produced a byte, which selects between the
-	// first-byte budget and the mid-body one. it is never reset: the generous budget is for a cold
-	// start, and a transfer only starts cold once
+	// delivered records whether the transfer has produced a byte, which is what arms the stall
+	// watchdog. it is never reset: a transfer starts cold once, and after that silence is silence
 	delivered bool
 	stalls    int
 	resumes   int
@@ -347,14 +330,12 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 // interrupted: every read that delivers bytes arms a fresh one, and a caller that stops reading is
 // not on a clock at all.
 func (b *resumableBody) readWithDeadline(body io.Reader, p []byte) (int, error) {
-	if b.stallTimeout <= 0 {
+	// nothing is on a clock until the transfer has produced a byte: see readStallTimeout
+	if b.stallTimeout <= 0 || !b.delivered {
 		return body.Read(p)
 	}
 
 	timeout := b.stallTimeout
-	if !b.delivered && b.firstByte > 0 {
-		timeout = b.firstByte
-	}
 
 	// the cancel is captured here and handed to the watchdog rather than read from the struct when
 	// it fires. a timer that fires in the instant a read returns runs on its own goroutine, and by
@@ -769,7 +750,14 @@ func (b *resumableBody) refusedStatus(resp *http.Response) error {
 		return fmt.Errorf("%w: got %d resuming at byte %d", errCredentialsRejected,
 			resp.StatusCode, b.offset)
 
-	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError:
+	case resp.StatusCode == http.StatusTooManyRequests ||
+		resp.StatusCode >= http.StatusInternalServerError ||
+		// 408, 421 and 425 are transient by specification rather than by convention. 421 in
+		// particular names retrying on a fresh connection as its remedy, which is exactly what the
+		// next attempt does, and HTTP/2 connection coalescing is what provokes it
+		resp.StatusCode == http.StatusRequestTimeout ||
+		resp.StatusCode == http.StatusMisdirectedRequest ||
+		resp.StatusCode == http.StatusTooEarly:
 		// the server's own Retry-After is deliberately not read: the stall backoff already spaces
 		// repeated attempts, and honouring a hint of minutes would only lengthen a pull that is
 		// already failing
