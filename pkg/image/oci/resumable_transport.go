@@ -57,12 +57,12 @@ const (
 	// upstream metadata and only then fetches from origin -- and holding a cold start to the
 	// mid-body budget would fail a pull that previously merely ran slowly.
 	//
-	// it covers the opening request only, not every attempt. a reopen goes to a host that has just
-	// demonstrated it has the object positioned and streaming, and reopenHeaderTimeout already
-	// bounds it reaching that point, so a resumed segment that then says nothing is silence rather
-	// than cold start. that distinction is what keeps the worst case bounded: were this spent on
-	// each of maxTotalResumes attempts, a server that trickles just enough to replenish the stall
-	// budget and then goes quiet could hold a pull for the better part of an hour.
+	// it covers the transfer until its first byte, however many attempts that takes, rather than
+	// being spent afresh on each one. a reopen that has delivered nothing is still a cold start; a
+	// reopen that has delivered something goes to a host that has just
+	// demonstrated it has the object positioned and streaming, so silence after that is silence
+	// rather than cold start. a run of cold starts is bounded by maxConsecutiveStalls, since none of
+	// them delivers anything to replenish the budget.
 	//
 	// these products run on servers and corporate estates, where a minute of silence before the
 	// first byte means something is actually broken rather than merely slow, so the budget is sized
@@ -596,8 +596,15 @@ func (b *resumableBody) reopen() (io.ReadCloser, error) {
 	}
 
 	req := b.req.Clone(ctx)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", b.offset, b.total-1))
 	req.Header.Set("Accept-Encoding", "identity")
+
+	// a range is only asked for once there is a prefix to splice onto. at offset zero there is
+	// none, so the request goes out exactly as it did the first time: nothing is preserved by the
+	// Range header there, and asking for one lets a server with no range support answer 200 and be
+	// classified as permanently unable to resume, failing a layer that would otherwise have arrived
+	if b.offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", b.offset, b.total-1))
+	}
 
 	// stopped once headers arrive, so the clock is on reaching the server rather than on the
 	// transfer that follows. a timer that fires in the instant before Stop costs one attempt of the
@@ -665,6 +672,22 @@ func (b *resumableBody) acceptable(resp *http.Response) (io.ReadCloser, error) {
 		return nil, err
 	}
 
+	// nothing has been delivered, so reopen asked for no range and a plain 200 is the right answer:
+	// this is a restart rather than a resume, and there is no prefix for the wrong bytes to be
+	// spliced onto. the length still has to match, or the object is not the one the read began with
+	if b.offset == 0 && resp.StatusCode == http.StatusOK {
+		if !identityEncoded(resp.Header.Get("Content-Encoding")) {
+			return reject(fmt.Errorf("%w: the restarted body came back encoded", errNoRangeSupport))
+		}
+
+		if resp.ContentLength != b.total {
+			return reject(fmt.Errorf("%w: the object is now %d bytes, it was %d when the read began",
+				errObjectChanged, resp.ContentLength, b.total))
+		}
+
+		return resp.Body, nil
+	}
+
 	if resp.StatusCode != http.StatusPartialContent {
 		return reject(b.refusedStatus(resp))
 	}
@@ -696,6 +719,11 @@ func (b *resumableBody) acceptable(resp *http.Response) (io.ReadCloser, error) {
 			errNoRangeSupport))
 	}
 
+	if total >= 0 && total != b.total {
+		return reject(fmt.Errorf("%w: the blob is now %d bytes, it was %d when the read began",
+			errObjectChanged, total, b.total))
+	}
+
 	if end >= 0 {
 		if end < start {
 			return reject(fmt.Errorf("%w: Content-Range ends at byte %d, before the byte %d it starts at",
@@ -717,11 +745,6 @@ func (b *resumableBody) acceptable(resp *http.Response) (io.ReadCloser, error) {
 			return reject(fmt.Errorf("%w: Content-Range covers %d bytes but %d were sent",
 				errNoRangeSupport, span, resp.ContentLength))
 		}
-	}
-
-	if total >= 0 && total != b.total {
-		return reject(fmt.Errorf("%w: the blob is now %d bytes, it was %d when the read began",
-			errObjectChanged, total, b.total))
 	}
 
 	return resp.Body, nil
