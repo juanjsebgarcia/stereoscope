@@ -98,14 +98,16 @@ var errCredentialsRejected = errors.New("the server rejected the credentials on 
 // progress, and reopens in total. an earlier revision carried five interacting ones, and each
 // extra strangled some legitimate transfer before it was tuned back, so the pair is kept
 // deliberately plain. between them they bound the number of attempts; the only clock is on a
-// reopen producing response headers, never on the transfer itself.
+// reopen producing response headers, never on the transfer itself, which stays as slow as the
+// caller wants it to be.
 type resumableTransport struct {
-	base        http.RoundTripper
-	minSize     int64
-	minProgress int64
-	backoff     time.Duration
-	maxStalls   int
-	maxResumes  int
+	base          http.RoundTripper
+	minSize       int64
+	minProgress   int64
+	backoff       time.Duration
+	headerTimeout time.Duration
+	maxStalls     int
+	maxResumes    int
 }
 
 func newResumableTransport(base http.RoundTripper) *resumableTransport {
@@ -114,34 +116,73 @@ func newResumableTransport(base http.RoundTripper) *resumableTransport {
 	}
 
 	return &resumableTransport{
-		base:        base,
-		minSize:     resumeMinSize,
-		minProgress: minResumeProgress,
-		backoff:     stallBackoff,
-		maxStalls:   maxConsecutiveStalls,
-		maxResumes:  maxTotalResumes,
+		base:          base,
+		minSize:       resumeMinSize,
+		minProgress:   minResumeProgress,
+		backoff:       stallBackoff,
+		headerTimeout: reopenHeaderTimeout,
+		maxStalls:     maxConsecutiveStalls,
+		maxResumes:    maxTotalResumes,
 	}
 }
 
 func (t *resumableTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.base.RoundTrip(req)
+	// the body that arrives before any resume needs a cancel of its own, so that Close can abort a
+	// read in flight on it. closing the body is not enough on HTTP/1: http.body.Read holds a mutex
+	// for the length of the read, so a Close issued from another goroutine queues behind the very
+	// read it means to interrupt. reopen mints one per attempt; this is the equivalent for the
+	// first. the request stored below is the caller's, not this clone, so resumes are still derived
+	// from the caller's context and finished() still reads the caller's cancellation, not ours.
+	ctx, cancel := context.WithCancel(req.Context())
+
+	resp, err := t.base.RoundTrip(req.WithContext(ctx))
 	if err != nil || !t.shouldResume(req, resp) {
-		return resp, err
+		return releasing(resp, cancel), err
 	}
 
 	resp.Body = &resumableBody{
-		body:        resp.Body,
-		req:         req,
-		base:        t.base,
-		total:       resp.ContentLength,
-		minProgress: t.minProgress,
-		backoff:     t.backoff,
-		maxStalls:   t.maxStalls,
-		maxResumes:  t.maxResumes,
-		done:        make(chan struct{}),
+		body:          resp.Body,
+		cancel:        cancel,
+		req:           req,
+		base:          t.base,
+		total:         resp.ContentLength,
+		minProgress:   t.minProgress,
+		backoff:       t.backoff,
+		headerTimeout: t.headerTimeout,
+		maxStalls:     t.maxStalls,
+		maxResumes:    t.maxResumes,
+		done:          make(chan struct{}),
 	}
 
 	return resp, nil
+}
+
+// releasing hands back a response this transport is not wrapping, arranging for the context minted
+// for it to be released once the body is closed. cancelling here instead would abort the very body
+// being returned.
+func releasing(resp *http.Response, cancel context.CancelFunc) *http.Response {
+	if resp == nil || resp.Body == nil {
+		cancel()
+
+		return resp
+	}
+
+	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+
+	return resp
+}
+
+// cancelOnClose releases a request context when the body it governs is closed. a CancelFunc is safe
+// to call more than once, so a repeated Close needs no guard of its own.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	defer c.cancel()
+
+	return c.ReadCloser.Close()
 }
 
 // shouldResume reports whether a response body is worth wrapping: a plain GET, not itself a range
@@ -153,7 +194,8 @@ func (t *resumableTransport) RoundTrip(req *http.Request) (*http.Response, error
 // ContentLength to -1 for those. the coding must be identity for the same reason: the offsets are
 // always over wire bytes, and an identity segment cannot be spliced onto a stream that is not.
 func (t *resumableTransport) shouldResume(req *http.Request, resp *http.Response) bool {
-	return req.Method == http.MethodGet &&
+	return resp != nil &&
+		req.Method == http.MethodGet &&
 		// Clone shares the body reader, so a reissued request would resend a consumed one
 		(req.Body == nil || req.Body == http.NoBody) &&
 		req.Header.Get("Range") == "" &&
@@ -170,17 +212,19 @@ func (t *resumableTransport) shouldResume(req *http.Request, resp *http.Response
 // many bytes it has delivered so that a failed read can be continued with a Range request rather
 // than restarting a transfer that may already be gigabytes along.
 type resumableBody struct {
-	req         *http.Request
-	base        http.RoundTripper
-	total       int64
-	minProgress int64
-	backoff     time.Duration
-	maxStalls   int
-	maxResumes  int
+	req           *http.Request
+	base          http.RoundTripper
+	total         int64
+	minProgress   int64
+	backoff       time.Duration
+	headerTimeout time.Duration
+	maxStalls     int
+	maxResumes    int
 
 	// mu guards body, cancel and closed, which Close may touch from another goroutine while Read is
-	// blocked or mid-resume. closing a Response.Body to abort a read is documented, legal usage of the
-	// standard library, so the wrapper has to honour it.
+	// blocked or mid-resume. a caller closing a Response.Body to abort a read is ordinary usage, so
+	// the wrapper has to honour it -- and it is why Close cancels as well as closes, since on HTTP/1
+	// a Close alone would queue behind the very read it means to interrupt.
 	mu     sync.Mutex
 	body   io.ReadCloser
 	closed bool
@@ -237,7 +281,7 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 		if done, final := b.finished(); done {
 			return n, b.latch(final)
 		}
-		if resumeErr := b.resume(readErr); resumeErr != nil {
+		if resumeErr := b.resume(shortRead(readErr)); resumeErr != nil {
 			return n, b.latch(resumeErr)
 		}
 		if n > 0 {
@@ -245,6 +289,25 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 			return n, nil
 		}
 	}
+}
+
+// shortRead renames the error of a stream that stopped before its declared length was delivered.
+//
+// net/http reports a body that simply ends as io.EOF, and the terminal failures below wrap their
+// cause so that the sentinels this path raises stay classifiable. wrapping a bare io.EOF along with
+// them would make errors.Is(err, io.EOF) true on a truncation, and a clean end of stream is exactly
+// what a truncation must never be mistakable for: this repo's own file.IterateTar breaks on that
+// test and returns nil, as do several go-containerregistry helpers, so a layer we failed to fetch
+// would become a silently short SBOM -- the outcome this whole transport exists to prevent.
+//
+// it is called where the stream is known to be short, after finished() has ruled out a body that
+// arrived in full.
+func shortRead(readErr error) error {
+	if errors.Is(readErr, io.EOF) {
+		return io.ErrUnexpectedEOF
+	}
+
+	return readErr
 }
 
 // latch records the error that ended the stream so every subsequent Read returns it, rather than
@@ -329,7 +392,11 @@ func (b *resumableBody) resume(cause error) error {
 					forLog(b.req.URL), b.offset, cause, err)
 			}
 
-			cause = err
+			// the same renaming the read error gets, and for the same reason: http.Transport hands
+			// back a bare io.EOF when a peer accepts the connection, reads the request and closes
+			// without answering -- which is precisely what a drained CDN edge does, and is how this
+			// path is reached at all
+			cause = shortRead(err)
 
 			continue
 		}
@@ -412,24 +479,46 @@ func (b *resumableBody) reopen() (io.ReadCloser, error) {
 	}
 
 	req := b.req.Clone(ctx)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", b.offset, b.total-1))
 	req.Header.Set("Accept-Encoding", "identity")
+
+	// a range is only asked for once there is a prefix to splice onto. at offset zero there is
+	// none, so the request goes out exactly as it did the first time: nothing is preserved by the
+	// Range header there, and asking for one lets a server with no range support answer 200 and be
+	// classified as permanently unable to resume, failing a layer that would otherwise have arrived
+	if b.offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", b.offset, b.total-1))
+	}
 
 	// stopped once headers arrive, so the clock is on reaching the server rather than on the
 	// transfer that follows. a timer that fires in the instant before Stop costs one attempt of the
 	// budget, which is why this is not the only thing bounding the read
-	headers := time.AfterFunc(reopenHeaderTimeout, cancel)
+	var headers *time.Timer
+	if b.headerTimeout > 0 {
+		headers = time.AfterFunc(b.headerTimeout, cancel)
+	}
+
 	resp, err := b.base.RoundTrip(req)
-	timedOut := !headers.Stop()
+	timedOut := headers != nil && !headers.Stop()
 
 	if err != nil {
 		if timedOut {
 			// the cancellation was ours, not the caller's. left bare it surfaces as "context
 			// canceled", which is indistinguishable from a Ctrl-C nobody pressed
-			return nil, fmt.Errorf("no response headers within %s: %w", reopenHeaderTimeout, err)
+			return nil, fmt.Errorf("no response headers within %s: %v", b.headerTimeout, err)
 		}
 
 		return nil, err
+	}
+
+	if timedOut {
+		// the timer fired in the instant before Stop, so this response is already condemned: its
+		// context is cancelled and the first read of it would fail. spending an attempt on that
+		// body is worse than spending one here, where the reason is still known
+		if resp.Body != nil {
+			closeQuietly(resp.Body)
+		}
+
+		return nil, fmt.Errorf("no response headers within %s", b.headerTimeout)
 	}
 
 	return b.acceptable(resp)
@@ -466,6 +555,27 @@ func (b *resumableBody) acceptable(resp *http.Response) (io.ReadCloser, error) {
 		return nil, err
 	}
 
+	// nothing has been delivered, so reopen asked for no range and a plain 200 is the right answer:
+	// this is a restart rather than a resume, and there is no prefix for the wrong bytes to be
+	// spliced onto. the length still has to match, or the object is not the one the read began with
+	if b.offset == 0 && resp.StatusCode == http.StatusOK {
+		if !identityEncoded(resp.Header.Get("Content-Encoding")) {
+			return reject(fmt.Errorf("%w: the restarted body came back encoded", errNoRangeSupport))
+		}
+
+		if resp.ContentLength < 0 {
+			return reject(fmt.Errorf("%w: the restarted body declared no length, so it cannot be "+
+				"told from a short one", errNoRangeSupport))
+		}
+
+		if resp.ContentLength != b.total {
+			return reject(fmt.Errorf("%w: the object is now %d bytes, it was %d when the read began",
+				errObjectChanged, resp.ContentLength, b.total))
+		}
+
+		return resp.Body, nil
+	}
+
 	if resp.StatusCode != http.StatusPartialContent {
 		return reject(b.refusedStatus(resp))
 	}
@@ -487,20 +597,42 @@ func (b *resumableBody) acceptable(resp *http.Response) (io.ReadCloser, error) {
 			errNoRangeSupport, start, b.offset))
 	}
 
-	// a server that ignored the Range and began the object again, while still echoing back the
-	// range it was asked for, contradicts itself here: the body it declares is longer than the
-	// span it claims to be sending. it cannot catch a server whose lengths agree and whose bytes
-	// are simply wrong -- only the digest above can do that -- but it is the shape a server with
-	// no real range support actually takes, and catching it here costs one request instead of a
-	// whole layer
-	if span := end - start + 1; end >= start && resp.ContentLength >= 0 && resp.ContentLength != span {
-		return reject(fmt.Errorf("%w: Content-Range covers %d bytes but %d were sent",
-			errNoRangeSupport, span, resp.ContentLength))
+	// RFC 9110 requires a 206 to give a last byte position, and either a complete length or "*". a
+	// Content-Range carrying neither is malformed, and it is the one combination that switches off
+	// both the span check below and the changed-object check after it at once, leaving the start
+	// offset as the only thing between us and a body of the right length and the wrong bytes.
+	// tolerating the leniencies separately is deliberate; tolerating both at once is not
+	if end < 0 && total < 0 {
+		return reject(fmt.Errorf("%w: Content-Range gives neither a last byte position nor a total",
+			errNoRangeSupport))
 	}
 
 	if total >= 0 && total != b.total {
 		return reject(fmt.Errorf("%w: the blob is now %d bytes, it was %d when the read began",
 			errObjectChanged, total, b.total))
+	}
+
+	if end >= 0 {
+		if end < start {
+			return reject(fmt.Errorf("%w: Content-Range ends at byte %d, before the byte %d it starts at",
+				errNoRangeSupport, end, start))
+		}
+
+		if end > b.total-1 {
+			return reject(fmt.Errorf("%w: Content-Range ends at byte %d, past the last byte of a %d byte object",
+				errNoRangeSupport, end, b.total))
+		}
+
+		// a server that ignored the Range and began the object again, while still echoing back the
+		// range it was asked for, contradicts itself here: the body it declares is longer than the
+		// span it claims to be sending. it cannot catch a server whose lengths agree and whose bytes
+		// are simply wrong -- only the digest above can do that -- but it is the shape a server with
+		// no real range support actually takes, and catching it here costs one request instead of a
+		// whole layer
+		if span := end - start + 1; resp.ContentLength >= 0 && resp.ContentLength != span {
+			return reject(fmt.Errorf("%w: Content-Range covers %d bytes but %d were sent",
+				errNoRangeSupport, span, resp.ContentLength))
+		}
 	}
 
 	return resp.Body, nil
@@ -519,7 +651,14 @@ func (b *resumableBody) refusedStatus(resp *http.Response) error {
 		return fmt.Errorf("%w: got %d resuming at byte %d", errCredentialsRejected,
 			resp.StatusCode, b.offset)
 
-	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError:
+	case resp.StatusCode == http.StatusTooManyRequests ||
+		resp.StatusCode >= http.StatusInternalServerError ||
+		// 408, 421 and 425 are transient by specification rather than by convention. 421 in
+		// particular names retrying on a fresh connection as its remedy, which is exactly what the
+		// next attempt does, and HTTP/2 connection coalescing is what provokes it
+		resp.StatusCode == http.StatusRequestTimeout ||
+		resp.StatusCode == http.StatusMisdirectedRequest ||
+		resp.StatusCode == http.StatusTooEarly:
 		// the server's own Retry-After is deliberately not read: the stall backoff already spaces
 		// repeated attempts, and honouring a hint of minutes would only lengthen a pull that is
 		// already failing
