@@ -57,9 +57,10 @@ const (
 	// upstream metadata and only then fetches from origin -- and holding a cold start to the
 	// mid-body budget would fail a pull that previously merely ran slowly.
 	//
-	// it covers the transfer until its first byte, however many attempts that takes, rather than
-	// being spent afresh on each one. a reopen that has delivered nothing is still a cold start; a
-	// reopen that has delivered something goes to a host that has just
+	// it covers the transfer until its first byte rather than each attempt separately, in the sense
+	// that it stops applying for good once anything arrives -- though while nothing has, each
+	// attempt does arm its own, so a transfer that never starts can spend it maxConsecutiveStalls
+	// times over. a reopen that has delivered something goes to a host that has just
 	// demonstrated it has the object positioned and streaming, so silence after that is silence
 	// rather than cold start. a run of cold starts is bounded by maxConsecutiveStalls, since none of
 	// them delivers anything to replenish the budget.
@@ -678,6 +679,11 @@ func (b *resumableBody) acceptable(resp *http.Response) (io.ReadCloser, error) {
 	if b.offset == 0 && resp.StatusCode == http.StatusOK {
 		if !identityEncoded(resp.Header.Get("Content-Encoding")) {
 			return reject(fmt.Errorf("%w: the restarted body came back encoded", errNoRangeSupport))
+		}
+
+		if resp.ContentLength < 0 {
+			return reject(fmt.Errorf("%w: the restarted body declared no length, so it cannot be "+
+				"told from a short one", errNoRangeSupport))
 		}
 
 		if resp.ContentLength != b.total {

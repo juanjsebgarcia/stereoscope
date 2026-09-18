@@ -925,7 +925,7 @@ func TestResumableTransport_shouldResume(t *testing.T) {
 		{
 			name:     "a caller's own range request is left alone",
 			req:      get("bytes=10-"),
-			resp:     response(http.StatusPartialContent, resumeMinSize),
+			resp:     response(http.StatusOK, resumeMinSize),
 			expected: false,
 		},
 		{
@@ -1970,8 +1970,11 @@ func TestResumableTransport_refusesAnUncheckableOrImpossibleContentRange(t *test
 		{
 			// diagnosed as the object changing rather than as a server that cannot do ranges, which
 			// is what an operator needs to read
+			// the end is past the object as well, so both the position check and the changed-object
+			// check fire. which one is reported is the whole point: an object that grew should be
+			// diagnosed as one, not as a server that cannot do ranges
 			name:         "a total that no longer matches the object the read began with",
-			contentRange: fmt.Sprintf("bytes %d-%d/%d", prefix, len(payload)-1, len(payload)*2),
+			contentRange: fmt.Sprintf("bytes %d-%d/%d", prefix, len(payload)*2-1, len(payload)*2),
 			expected:     errObjectChanged,
 		},
 	}
@@ -2005,6 +2008,10 @@ func TestResumableTransport_refusesAnUncheckableOrImpossibleContentRange(t *test
 type noRangeServer struct {
 	payload []byte
 	release chan struct{}
+	// restartLength, when set, is the length the restart declares and delivers instead of the whole
+	// object; restartCoding, when set, is a Content-Encoding it claims for the restarted body
+	restartLength int
+	restartCoding string
 
 	mu       sync.Mutex
 	attempts int
@@ -2018,7 +2025,16 @@ func (s *noRangeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.ranges = append(s.ranges, r.Header.Get("Range"))
 	s.mu.Unlock()
 
-	w.Header().Set("Content-Length", strconv.Itoa(len(s.payload)))
+	body := s.payload
+	if !first && s.restartLength > 0 {
+		body = s.payload[:s.restartLength]
+	}
+
+	if !first && s.restartCoding != "" {
+		w.Header().Set("Content-Encoding", s.restartCoding)
+	}
+
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	w.(http.Flusher).Flush()
 
@@ -2027,7 +2043,7 @@ func (s *noRangeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, _ = w.Write(s.payload)
+	_, _ = w.Write(body)
 }
 
 func (s *noRangeServer) seenRanges() []string {
@@ -2087,4 +2103,66 @@ func Test_forLog(t *testing.T) {
 	assert.Equal(t, "cdn.example.com/v2/img/blobs/sha256:abc", rendered)
 	assert.NotContains(t, rendered, "SECRET", "a signed URL's credentials must never be rendered")
 	assert.NotContains(t, rendered, "?")
+}
+
+func TestResumableTransport_checksTheRestartedBodyItAccepts(t *testing.T) {
+	// the restart path skips the range checks because there is nothing to splice onto, which leaves
+	// two guards carrying it alone. neither had a test, and losing either to a refactor would hand
+	// the caller the wrong bytes on the one path with no digest above it to notice
+	payload := payloadOfSize(64 * 1024)
+
+	tests := []struct {
+		name     string
+		server   func(chan struct{}) *noRangeServer
+		expected error
+	}{
+		{
+			name: "a restart of a different length is refused",
+			server: func(release chan struct{}) *noRangeServer {
+				return &noRangeServer{payload: payload, release: release, restartLength: len(payload) / 2}
+			},
+			expected: errObjectChanged,
+		},
+		{
+			name: "a restart in a different coding is refused",
+			server: func(release chan struct{}) *noRangeServer {
+				return &noRangeServer{payload: payload, release: release, restartCoding: "gzip"}
+			},
+			expected: errNoRangeSupport,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			release := make(chan struct{})
+			server := test.server(release)
+
+			srv := httptest.NewServer(server)
+			t.Cleanup(func() { close(release); srv.Close() })
+
+			transport := newTestTransport(1)
+			transport.firstByte = 50 * time.Millisecond
+			transport.stallTimeout = 30 * time.Second
+
+			resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = resp.Body.Close() })
+
+			done := make(chan error, 1)
+			go func() {
+				_, readErr := io.ReadAll(resp.Body)
+				done <- readErr
+			}()
+
+			select {
+			case readErr := <-done:
+				require.Error(t, readErr)
+				assert.ErrorIs(t, readErr, test.expected)
+				assert.NotErrorIs(t, readErr, io.EOF,
+					"a refused restart is not a clean end of stream either")
+			case <-time.After(20 * time.Second):
+				t.Fatal("the refused restart never ended the read")
+			}
+		})
+	}
 }
