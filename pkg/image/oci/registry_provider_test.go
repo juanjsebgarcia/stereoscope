@@ -2,6 +2,7 @@ package oci
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
@@ -448,6 +449,25 @@ func Test_RegistryProvider_blobResumeCanBeDisabled(t *testing.T) {
 
 	getTransportWithEffectiveURL(nil, effective, true)
 	assert.IsType(t, &http.Transport{}, effective.base, "DisableBlobResume removes it from the chain")
+}
+
+func Test_RegistryProvider_tlsConfigSurvivesTheResumableTransport(t *testing.T) {
+	// the resumable transport is layered between the effective-URL wrapper and the transport that
+	// carries the TLS settings, and reopen reissues through that same base. a future re-layering
+	// that built its own base would silently drop client certs, InsecureSkipTLSVerify and
+	// CAFileOrDir, and every existing test would still pass
+	tlsConfig := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // the point of the assertion
+	effective := newEffectiveURLTransport(nil)
+
+	getTransportWithEffectiveURL(tlsConfig, effective, false)
+
+	resumable, ok := effective.base.(*resumableTransport)
+	require.True(t, ok, "resuming should be in the chain")
+
+	inner, ok := resumable.base.(*http.Transport)
+	require.True(t, ok, "the resumable transport should wrap the TLS-configured transport")
+	assert.Same(t, tlsConfig, inner.TLSClientConfig,
+		"the TLS config must reach the transport that actually dials")
 }
 
 func makeRegistry(t *testing.T) (registryHost string) {
