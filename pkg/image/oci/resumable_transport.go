@@ -51,6 +51,15 @@ const (
 	// a body that is arriving slowly is never on a clock.
 	reopenHeaderTimeout = 30 * time.Second
 
+	// firstByteTimeout is the budget for the first read of an attempt, which is a different thing
+	// from the silence readStallTimeout bounds. a response can legitimately carry its headers and
+	// Content-Length well before its first body byte -- a pull-through cache or a scanning proxy
+	// answers from upstream metadata and only then fetches the object -- and holding that to the
+	// mid-body budget would fail a pull that previously merely ran slowly. it is generous because
+	// it is not the case this transport was written for: nothing observed stalls before the first
+	// byte, and the bound exists so that such a server is still bounded, not so that it is punished.
+	firstByteTimeout = 2 * time.Minute
+
 	// readStallTimeout bounds how long a single read may wait for bytes that never come. an
 	// unhealthy CDN edge does not close the connection when it stops serving a body: it simply goes
 	// quiet, and the read blocks until the peer eventually errors, which measured around two minutes
@@ -58,7 +67,8 @@ const (
 	// server and nothing covers the transfer, so without this the resume machinery cannot learn that
 	// anything is wrong until the peer decides to tell it.
 	//
-	// it is armed around a single Read and disarmed the moment that Read returns, so it measures the
+	// it applies once the attempt has delivered a byte; until then firstByteTimeout does. it is
+	// armed around a single Read and disarmed the moment that Read returns, so it measures the
 	// server's silence while we are actually waiting on it and never the caller's own think time.
 	// that distinction is the point rather than an optimisation: the truncation this recovers from
 	// is provoked by consuming slowly, so a clock over the transfer as a whole would abandon exactly
@@ -120,13 +130,15 @@ var errReadStalled = errors.New("the server stopped sending and the read stalled
 // waiting: one on a reopen producing response headers, one on a read producing bytes. neither is a
 // clock on the transfer itself, which stays as slow as the caller wants it to be.
 type resumableTransport struct {
-	base         http.RoundTripper
-	minSize      int64
-	minProgress  int64
-	backoff      time.Duration
-	stallTimeout time.Duration
-	maxStalls    int
-	maxResumes   int
+	base          http.RoundTripper
+	minSize       int64
+	minProgress   int64
+	backoff       time.Duration
+	stallTimeout  time.Duration
+	firstByte     time.Duration
+	headerTimeout time.Duration
+	maxStalls     int
+	maxResumes    int
 }
 
 func newResumableTransport(base http.RoundTripper) *resumableTransport {
@@ -135,13 +147,15 @@ func newResumableTransport(base http.RoundTripper) *resumableTransport {
 	}
 
 	return &resumableTransport{
-		base:         base,
-		minSize:      resumeMinSize,
-		minProgress:  minResumeProgress,
-		backoff:      stallBackoff,
-		stallTimeout: readStallTimeout,
-		maxStalls:    maxConsecutiveStalls,
-		maxResumes:   maxTotalResumes,
+		base:          base,
+		minSize:       resumeMinSize,
+		minProgress:   minResumeProgress,
+		backoff:       stallBackoff,
+		stallTimeout:  readStallTimeout,
+		firstByte:     firstByteTimeout,
+		headerTimeout: reopenHeaderTimeout,
+		maxStalls:     maxConsecutiveStalls,
+		maxResumes:    maxTotalResumes,
 	}
 }
 
@@ -159,17 +173,19 @@ func (t *resumableTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 
 	resp.Body = &resumableBody{
-		body:         resp.Body,
-		cancel:       cancel,
-		req:          req,
-		base:         t.base,
-		total:        resp.ContentLength,
-		minProgress:  t.minProgress,
-		backoff:      t.backoff,
-		stallTimeout: t.stallTimeout,
-		maxStalls:    t.maxStalls,
-		maxResumes:   t.maxResumes,
-		done:         make(chan struct{}),
+		body:          resp.Body,
+		cancel:        cancel,
+		req:           req,
+		base:          t.base,
+		total:         resp.ContentLength,
+		minProgress:   t.minProgress,
+		backoff:       t.backoff,
+		stallTimeout:  t.stallTimeout,
+		firstByte:     t.firstByte,
+		headerTimeout: t.headerTimeout,
+		maxStalls:     t.maxStalls,
+		maxResumes:    t.maxResumes,
+		done:          make(chan struct{}),
 	}
 
 	return resp, nil
@@ -212,7 +228,8 @@ func (c *cancelOnClose) Close() error {
 // ContentLength to -1 for those. the coding must be identity for the same reason: the offsets are
 // always over wire bytes, and an identity segment cannot be spliced onto a stream that is not.
 func (t *resumableTransport) shouldResume(req *http.Request, resp *http.Response) bool {
-	return req.Method == http.MethodGet &&
+	return resp != nil &&
+		req.Method == http.MethodGet &&
 		// Clone shares the body reader, so a reissued request would resend a consumed one
 		(req.Body == nil || req.Body == http.NoBody) &&
 		req.Header.Get("Range") == "" &&
@@ -229,14 +246,16 @@ func (t *resumableTransport) shouldResume(req *http.Request, resp *http.Response
 // many bytes it has delivered so that a failed read can be continued with a Range request rather
 // than restarting a transfer that may already be gigabytes along.
 type resumableBody struct {
-	req          *http.Request
-	base         http.RoundTripper
-	total        int64
-	minProgress  int64
-	backoff      time.Duration
-	stallTimeout time.Duration
-	maxStalls    int
-	maxResumes   int
+	req           *http.Request
+	base          http.RoundTripper
+	total         int64
+	minProgress   int64
+	backoff       time.Duration
+	stallTimeout  time.Duration
+	firstByte     time.Duration
+	headerTimeout time.Duration
+	maxStalls     int
+	maxResumes    int
 
 	// mu guards body, cancel and closed, which Close and the stall watchdog may touch from another
 	// goroutine while Read is blocked or mid-resume. a caller closing a Response.Body to abort a read
@@ -257,8 +276,12 @@ type resumableBody struct {
 	// the remainder belong to the reader and are not guarded: io.Reader admits a single reader
 	offset   int64
 	progress int64
-	stalls   int
-	resumes  int
+	// delivered records whether the current attempt has produced a byte, which selects between the
+	// first-byte budget and the mid-body one. reset on every resume, so each attempt earns its own
+	// grace rather than inheriting the previous one's
+	delivered bool
+	stalls    int
+	resumes   int
 	// failed latches the error that ended the stream, so a caller reading past a failure gets that
 	// error back rather than starting the download over
 	failed error
@@ -298,7 +321,7 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 		if done, final := b.finished(); done {
 			return n, b.latch(final)
 		}
-		if resumeErr := b.resume(readErr); resumeErr != nil {
+		if resumeErr := b.resume(shortRead(readErr)); resumeErr != nil {
 			return n, b.latch(resumeErr)
 		}
 		if n > 0 {
@@ -314,20 +337,48 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 // interrupted: every read that delivers bytes arms a fresh one, and a caller that stops reading is
 // not on a clock at all.
 func (b *resumableBody) readWithDeadline(body io.Reader, p []byte) (int, error) {
-	if b.stallTimeout <= 0 {
+	timeout := b.stallTimeout
+	if !b.delivered {
+		timeout = b.firstByte
+	}
+
+	if timeout <= 0 {
 		return body.Read(p)
 	}
 
-	watchdog := time.AfterFunc(b.stallTimeout, b.abandonStalledRead)
+	// the cancel is captured here and handed to the watchdog rather than read from the struct when
+	// it fires. a timer that fires in the instant a read returns runs on its own goroutine, and by
+	// the time it wins the mutex the reader may already have resumed -- at which point the field
+	// holds a healthy attempt's cancel, and re-reading it would kill that instead of this one
+	b.mu.Lock()
+	cancel := b.cancel
+	b.mu.Unlock()
+
+	watchdog := time.AfterFunc(timeout, func() { b.abandonStalledRead(cancel, timeout) })
 	n, readErr := body.Read(p)
 
 	// Stop reporting false means the watchdog has fired, or is firing, so the request under this
-	// read is on its way out whatever the read itself returned. keep the bytes and call it a stall
-	if !watchdog.Stop() && readErr == nil {
+	// read is on its way out whatever the read itself returned. keep the bytes and call it a stall.
+	//
+	// a cancellation here is ours rather than the caller's, and left bare it would reach a caller as
+	// "context canceled" -- a Ctrl-C nobody pressed, the same confusion reopen guards against for
+	// its own timer. an io.EOF is substituted for the same reason the terminal errors render their
+	// cause: a stall is not a clean end of stream and must not be mistakable for one
+	if !watchdog.Stop() && stalled(readErr) {
 		readErr = errReadStalled
 	}
 
 	return n, readErr
+}
+
+// stalled reports whether a read error is one the watchdog should relabel: the read ended with
+// nothing to say, or ended because the watchdog cancelled it. anything else is the server's own
+// error and is more informative than the label would be.
+func stalled(readErr error) bool {
+	return readErr == nil ||
+		errors.Is(readErr, io.EOF) ||
+		errors.Is(readErr, context.Canceled) ||
+		errors.Is(readErr, context.DeadlineExceeded)
 }
 
 // abandonStalledRead ends the request under the read in flight, which is what a read blocked inside
@@ -336,19 +387,34 @@ func (b *resumableBody) readWithDeadline(body io.Reader, p []byte) (int, error) 
 //
 // nothing owned by the reader is touched here, offset included, because this runs on the timer's
 // goroutine while Read is still in flight on another.
-func (b *resumableBody) abandonStalledRead() {
-	b.mu.Lock()
-	cancel := b.cancel
-	b.mu.Unlock()
-
+func (b *resumableBody) abandonStalledRead(cancel context.CancelFunc, timeout time.Duration) {
 	if cancel == nil {
 		return
 	}
 
-	log.WithFields("url", forLog(b.req.URL), "timeout", b.stallTimeout).
+	log.WithFields("url", forLog(b.req.URL), "timeout", timeout).
 		Debug("blob stream went quiet, abandoning the connection so the read can resume")
 
 	cancel()
+}
+
+// shortRead renames the error of a stream that stopped before its declared length was delivered.
+//
+// net/http reports a body that simply ends as io.EOF, and the terminal failures below wrap their
+// cause so that the sentinels this path raises stay classifiable. wrapping a bare io.EOF along with
+// them would make errors.Is(err, io.EOF) true on a truncation, and a clean end of stream is exactly
+// what a truncation must never be mistakable for: this repo's own file.IterateTar breaks on that
+// test and returns nil, as do several go-containerregistry helpers, so a layer we failed to fetch
+// would become a silently short SBOM -- the outcome this whole transport exists to prevent.
+//
+// it is called where the stream is known to be short, after finished() has ruled out a body that
+// arrived in full.
+func shortRead(readErr error) error {
+	if errors.Is(readErr, io.EOF) {
+		return io.ErrUnexpectedEOF
+	}
+
+	return readErr
 }
 
 // latch records the error that ended the stream so every subsequent Read returns it, rather than
@@ -368,6 +434,7 @@ func (b *resumableBody) record(n int) {
 
 	b.offset += int64(n)
 	b.progress += int64(n)
+	b.delivered = true
 
 	if b.progress >= b.minProgress {
 		b.stalls = 0
@@ -395,6 +462,7 @@ func (b *resumableBody) finished() (bool, error) {
 // until it succeeds or runs out of budget.
 func (b *resumableBody) resume(cause error) error {
 	b.closeCurrent()
+	b.delivered = false
 
 	for {
 		b.resumes++
@@ -522,7 +590,7 @@ func (b *resumableBody) reopen() (io.ReadCloser, error) {
 	// stopped once headers arrive, so the clock is on reaching the server rather than on the
 	// transfer that follows. a timer that fires in the instant before Stop costs one attempt of the
 	// budget, which is why this is not the only thing bounding the read
-	headers := time.AfterFunc(reopenHeaderTimeout, cancel)
+	headers := time.AfterFunc(b.headerTimeout, cancel)
 	resp, err := b.base.RoundTrip(req)
 	timedOut := !headers.Stop()
 
@@ -530,10 +598,21 @@ func (b *resumableBody) reopen() (io.ReadCloser, error) {
 		if timedOut {
 			// the cancellation was ours, not the caller's. left bare it surfaces as "context
 			// canceled", which is indistinguishable from a Ctrl-C nobody pressed
-			return nil, fmt.Errorf("no response headers within %s: %w", reopenHeaderTimeout, err)
+			return nil, fmt.Errorf("no response headers within %s: %v", b.headerTimeout, err)
 		}
 
 		return nil, err
+	}
+
+	if timedOut {
+		// the timer fired in the instant before Stop, so this response is already condemned: its
+		// context is cancelled and the first read of it would fail. spending an attempt on that
+		// body is worse than spending one here, where the reason is still known
+		if resp.Body != nil {
+			closeQuietly(resp.Body)
+		}
+
+		return nil, fmt.Errorf("no response headers within %s", b.headerTimeout)
 	}
 
 	return b.acceptable(resp)
