@@ -51,6 +51,20 @@ const (
 	// a body that is arriving slowly is never on a clock.
 	reopenHeaderTimeout = 30 * time.Second
 
+	// readStallTimeout bounds how long a single read may wait for bytes that never come. an
+	// unhealthy CDN edge does not close the connection when it stops serving a body: it simply goes
+	// quiet, and the read blocks until the peer eventually errors, which measured around two minutes
+	// against the registry that motivated this. reopenHeaderTimeout covers a reopen reaching the
+	// server and nothing covers the transfer, so without this the resume machinery cannot learn that
+	// anything is wrong until the peer decides to tell it.
+	//
+	// it is armed around a single Read and disarmed the moment that Read returns, so it measures the
+	// server's silence while we are actually waiting on it and never the caller's own think time.
+	// that distinction is the point rather than an optimisation: the truncation this recovers from
+	// is provoked by consuming slowly, so a clock over the transfer as a whole would abandon exactly
+	// the readers it exists to protect. it is set well above any pause a healthy CDN takes mid-blob.
+	readStallTimeout = 30 * time.Second
+
 	// stallBackoff is multiplied by the consecutive stall count to space out repeated attempts. the
 	// first attempt after a drop is made immediately, so an isolated drop costs no delay.
 	stallBackoff = time.Second
@@ -80,6 +94,11 @@ var errResumeUnavailable = errors.New("the server could not serve the resumed ra
 // giving this transport a way to re-authorize, which is a larger change than resuming.
 var errCredentialsRejected = errors.New("the server rejected the credentials on the resumed range request")
 
+// errReadStalled marks a read the stall watchdog ended. it is a resume cause like any other: the
+// bytes already delivered stand and the remainder is fetched on a fresh connection, so it is
+// deliberately absent from permanentResumeError.
+var errReadStalled = errors.New("the server stopped sending and the read stalled")
+
 // resumableTransport wraps a RoundTripper so that a large GET whose body fails partway through is
 // transparently resumed with a Range request from the byte already delivered.
 //
@@ -97,15 +116,17 @@ var errCredentialsRejected = errors.New("the server rejected the credentials on 
 // termination is two budgets and no more: consecutive attempts that deliver no meaningful
 // progress, and reopens in total. an earlier revision carried five interacting ones, and each
 // extra strangled some legitimate transfer before it was tuned back, so the pair is kept
-// deliberately plain. between them they bound the number of attempts; the only clock is on a
-// reopen producing response headers, never on the transfer itself.
+// deliberately plain. between them they bound the number of attempts, and two clocks bound the
+// waiting: one on a reopen producing response headers, one on a read producing bytes. neither is a
+// clock on the transfer itself, which stays as slow as the caller wants it to be.
 type resumableTransport struct {
-	base        http.RoundTripper
-	minSize     int64
-	minProgress int64
-	backoff     time.Duration
-	maxStalls   int
-	maxResumes  int
+	base         http.RoundTripper
+	minSize      int64
+	minProgress  int64
+	backoff      time.Duration
+	stallTimeout time.Duration
+	maxStalls    int
+	maxResumes   int
 }
 
 func newResumableTransport(base http.RoundTripper) *resumableTransport {
@@ -114,34 +135,72 @@ func newResumableTransport(base http.RoundTripper) *resumableTransport {
 	}
 
 	return &resumableTransport{
-		base:        base,
-		minSize:     resumeMinSize,
-		minProgress: minResumeProgress,
-		backoff:     stallBackoff,
-		maxStalls:   maxConsecutiveStalls,
-		maxResumes:  maxTotalResumes,
+		base:         base,
+		minSize:      resumeMinSize,
+		minProgress:  minResumeProgress,
+		backoff:      stallBackoff,
+		stallTimeout: readStallTimeout,
+		maxStalls:    maxConsecutiveStalls,
+		maxResumes:   maxTotalResumes,
 	}
 }
 
 func (t *resumableTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.base.RoundTrip(req)
+	// the body that arrives before any resume needs a cancel of its own, so that a stalled read can
+	// be abandoned without touching the caller's context -- cancelling that would end the whole
+	// pull. reopen mints one per attempt; this is the equivalent for the first attempt. the request
+	// stored below is the caller's, not this clone, so resumes are still derived from the caller's
+	// context and finished() still reads the caller's cancellation rather than ours.
+	ctx, cancel := context.WithCancel(req.Context())
+
+	resp, err := t.base.RoundTrip(req.WithContext(ctx))
 	if err != nil || !t.shouldResume(req, resp) {
-		return resp, err
+		return releasing(resp, cancel), err
 	}
 
 	resp.Body = &resumableBody{
-		body:        resp.Body,
-		req:         req,
-		base:        t.base,
-		total:       resp.ContentLength,
-		minProgress: t.minProgress,
-		backoff:     t.backoff,
-		maxStalls:   t.maxStalls,
-		maxResumes:  t.maxResumes,
-		done:        make(chan struct{}),
+		body:         resp.Body,
+		cancel:       cancel,
+		req:          req,
+		base:         t.base,
+		total:        resp.ContentLength,
+		minProgress:  t.minProgress,
+		backoff:      t.backoff,
+		stallTimeout: t.stallTimeout,
+		maxStalls:    t.maxStalls,
+		maxResumes:   t.maxResumes,
+		done:         make(chan struct{}),
 	}
 
 	return resp, nil
+}
+
+// releasing hands back a response this transport is not wrapping, arranging for the context minted
+// for it to be released once the body is closed. cancelling here instead would abort the very body
+// being returned.
+func releasing(resp *http.Response, cancel context.CancelFunc) *http.Response {
+	if resp == nil || resp.Body == nil {
+		cancel()
+
+		return resp
+	}
+
+	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+
+	return resp
+}
+
+// cancelOnClose releases a request context when the body it governs is closed. a CancelFunc is safe
+// to call more than once, so a repeated Close needs no guard of its own.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	defer c.cancel()
+
+	return c.ReadCloser.Close()
 }
 
 // shouldResume reports whether a response body is worth wrapping: a plain GET, not itself a range
@@ -170,17 +229,19 @@ func (t *resumableTransport) shouldResume(req *http.Request, resp *http.Response
 // many bytes it has delivered so that a failed read can be continued with a Range request rather
 // than restarting a transfer that may already be gigabytes along.
 type resumableBody struct {
-	req         *http.Request
-	base        http.RoundTripper
-	total       int64
-	minProgress int64
-	backoff     time.Duration
-	maxStalls   int
-	maxResumes  int
+	req          *http.Request
+	base         http.RoundTripper
+	total        int64
+	minProgress  int64
+	backoff      time.Duration
+	stallTimeout time.Duration
+	maxStalls    int
+	maxResumes   int
 
-	// mu guards body, cancel and closed, which Close may touch from another goroutine while Read is
-	// blocked or mid-resume. closing a Response.Body to abort a read is documented, legal usage of the
-	// standard library, so the wrapper has to honour it.
+	// mu guards body, cancel and closed, which Close and the stall watchdog may touch from another
+	// goroutine while Read is blocked or mid-resume. a caller closing a Response.Body to abort a read
+	// is ordinary usage, so the wrapper has to honour it -- and it is why Close cancels as well as
+	// closes, since on HTTP/1 a Close alone would queue behind the very read it means to interrupt.
 	mu     sync.Mutex
 	body   io.ReadCloser
 	closed bool
@@ -225,7 +286,7 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 			return 0, err
 		}
 
-		n, readErr := body.Read(p)
+		n, readErr := b.readWithDeadline(body, p)
 		b.record(n)
 
 		if readErr == nil {
@@ -245,6 +306,49 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 			return n, nil
 		}
 	}
+}
+
+// readWithDeadline performs one read under a deadline on the server producing anything at all.
+//
+// the deadline is disarmed as soon as the read returns, so a body that is merely slow is never
+// interrupted: every read that delivers bytes arms a fresh one, and a caller that stops reading is
+// not on a clock at all.
+func (b *resumableBody) readWithDeadline(body io.Reader, p []byte) (int, error) {
+	if b.stallTimeout <= 0 {
+		return body.Read(p)
+	}
+
+	watchdog := time.AfterFunc(b.stallTimeout, b.abandonStalledRead)
+	n, readErr := body.Read(p)
+
+	// Stop reporting false means the watchdog has fired, or is firing, so the request under this
+	// read is on its way out whatever the read itself returned. keep the bytes and call it a stall
+	if !watchdog.Stop() && readErr == nil {
+		readErr = errReadStalled
+	}
+
+	return n, readErr
+}
+
+// abandonStalledRead ends the request under the read in flight, which is what a read blocked inside
+// net/http responds to. closing the body is not enough: on HTTP/1 http.body.Read holds a mutex for
+// the length of the read, so Close would simply queue behind the read it is meant to interrupt.
+//
+// nothing owned by the reader is touched here, offset included, because this runs on the timer's
+// goroutine while Read is still in flight on another.
+func (b *resumableBody) abandonStalledRead() {
+	b.mu.Lock()
+	cancel := b.cancel
+	b.mu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+
+	log.WithFields("url", forLog(b.req.URL), "timeout", b.stallTimeout).
+		Debug("blob stream went quiet, abandoning the connection so the read can resume")
+
+	cancel()
 }
 
 // latch records the error that ended the stream so every subsequent Read returns it, rather than

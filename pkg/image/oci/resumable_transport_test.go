@@ -242,6 +242,98 @@ func newTestTransport(minSize int64) *resumableTransport {
 	return transport
 }
 
+// stallingBlobServer sends a prefix, flushes it, and then goes quiet without closing the connection
+// or writing another byte -- the shape an unhealthy CDN edge takes, and the one flakyBlobServer
+// cannot produce, since that tears the connection down instead. every later attempt is served in
+// full, so a test fails by hanging if the stalled read is never ended.
+type stallingBlobServer struct {
+	payload    []byte
+	stallAfter int
+	release    chan struct{}
+
+	mu       sync.Mutex
+	attempts int
+	ranges   []string
+}
+
+func (s *stallingBlobServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	s.ranges = append(s.ranges, r.Header.Get("Range"))
+	s.mu.Unlock()
+
+	start := int64(0)
+	status := http.StatusOK
+
+	if spec := r.Header.Get("Range"); spec != "" {
+		var end int64
+		if _, err := fmt.Sscanf(spec, "bytes=%d-%d", &start, &end); err != nil {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		status = http.StatusPartialContent
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(s.payload)-1, len(s.payload)))
+	}
+
+	remaining := s.payload[start:]
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Length", strconv.Itoa(len(remaining)))
+	w.WriteHeader(status)
+
+	if attempt > 1 {
+		_, _ = w.Write(remaining)
+		return
+	}
+
+	// the first attempt delivers a prefix and then says nothing more, holding the connection open
+	_, _ = w.Write(remaining[:s.stallAfter])
+	w.(http.Flusher).Flush()
+	<-s.release
+}
+
+func (s *stallingBlobServer) seenRanges() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ranges...)
+}
+
+// pacedBlobServer delivers the whole payload in small writes spaced apart, never pausing long
+// enough to be a stall. it guards the constant: a deadline that tracked slowness rather than
+// silence would abandon this transfer, which is exactly the reader the resume path exists for.
+type pacedBlobServer struct {
+	payload []byte
+	writes  int
+	gap     time.Duration
+
+	mu       sync.Mutex
+	attempts int
+}
+
+func (s *pacedBlobServer) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	s.attempts++
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Length", strconv.Itoa(len(s.payload)))
+	w.WriteHeader(http.StatusOK)
+
+	size := len(s.payload) / s.writes
+	for off := 0; off < len(s.payload); off += size {
+		end := min(off+size, len(s.payload))
+
+		_, _ = w.Write(s.payload[off:end])
+		w.(http.Flusher).Flush()
+		time.Sleep(s.gap)
+	}
+}
+
+func (s *pacedBlobServer) attemptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
 func newTestClient(minSize int64) *http.Client {
 	return &http.Client{Transport: newTestTransport(minSize)}
 }
@@ -1149,4 +1241,102 @@ func TestResumableTransport_refusesASegmentLongerThanTheRangeItClaims(t *testing
 
 	// permanent, so it costs one attempt rather than the whole budget
 	assert.Len(t, server.seenRanges(), 2)
+}
+
+func TestResumableTransport_endsAReadThatStalls(t *testing.T) {
+	// the failure this bounds is a body that stops arriving while the connection stays open, so the
+	// server is never released until cleanup: if the watchdog does not end the read, nothing will
+	payload := payloadOfSize(64 * 1024)
+	server := &stallingBlobServer{payload: payload, stallAfter: 1024, release: make(chan struct{})}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(func() { close(server.release); srv.Close() })
+
+	transport := newTestTransport(1)
+	transport.stallTimeout = 100 * time.Millisecond
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	started := time.Now()
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, payload, got, "the stalled prefix should be spliced onto the resumed remainder")
+	assert.Less(t, time.Since(started), 10*time.Second,
+		"the watchdog should end the stalled read rather than wait on a server that never speaks again")
+	assert.Equal(t, []string{"", "bytes=1024-65535"}, server.seenRanges(),
+		"the resume should ask for exactly the bytes the stalled attempt did not deliver")
+}
+
+func TestResumableTransport_leavesASlowButAdvancingBodyAlone(t *testing.T) {
+	// guards the constant against being read as a clock on slowness: this body takes far longer than
+	// the stall timeout to arrive in total, but is never silent for as long as one
+	payload := payloadOfSize(32 * 1024)
+	server := &pacedBlobServer{payload: payload, writes: 16, gap: 10 * time.Millisecond}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(srv.Close)
+
+	transport := newTestTransport(1)
+	transport.stallTimeout = 50 * time.Millisecond
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, payload, got)
+	assert.Equal(t, 1, server.attemptCount(), "a body that keeps delivering should never be resumed")
+}
+
+func TestResumableTransport_stallDeadlineIsOffWhenUnset(t *testing.T) {
+	// the zero value has to mean "no watchdog", since every existing test builds a transport without
+	// one and a body that simply takes its time must not be torn down
+	payload := payloadOfSize(8192)
+	server := &flakyBlobServer{payload: payload, dropsLeft: 1, bytesPerDrop: 1000}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(srv.Close)
+
+	transport := newTestTransport(1)
+	transport.stallTimeout = 0
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+}
+
+func TestResumableTransport_releasesTheContextOfAnUnwrappedBody(t *testing.T) {
+	// a response too small to wrap still carries a context minted by RoundTrip. closing its body has
+	// to release it, or every manifest fetch leaks one until the pull's own context is done
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("too small to wrap"))
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, err := newTestClient(1 << 20).Get(srv.URL)
+	require.NoError(t, err)
+
+	wrapped, ok := resp.Body.(*cancelOnClose)
+	require.True(t, ok, "an unwrapped body should still carry its cancel")
+
+	released := make(chan struct{})
+	original := wrapped.cancel
+	wrapped.cancel = func() { original(); close(released) }
+
+	require.NoError(t, resp.Body.Close())
+
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("closing the body should have released the context minted for it")
+	}
 }
