@@ -1,11 +1,15 @@
 package oci
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -240,6 +244,98 @@ func newTestTransport(minSize int64) *resumableTransport {
 	transport.minSize = minSize
 	transport.backoff = 0
 	return transport
+}
+
+// stallingBlobServer sends a prefix, flushes it, and then goes quiet without closing the connection
+// or writing another byte -- the shape an unhealthy CDN edge takes, and the one flakyBlobServer
+// cannot produce, since that tears the connection down instead. every later attempt is served in
+// full, so a test fails by hanging if the stalled read is never ended.
+type stallingBlobServer struct {
+	payload    []byte
+	stallAfter int
+	release    chan struct{}
+
+	mu       sync.Mutex
+	attempts int
+	ranges   []string
+}
+
+func (s *stallingBlobServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	s.ranges = append(s.ranges, r.Header.Get("Range"))
+	s.mu.Unlock()
+
+	start := int64(0)
+	status := http.StatusOK
+
+	if spec := r.Header.Get("Range"); spec != "" {
+		var end int64
+		if _, err := fmt.Sscanf(spec, "bytes=%d-%d", &start, &end); err != nil {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		status = http.StatusPartialContent
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(s.payload)-1, len(s.payload)))
+	}
+
+	remaining := s.payload[start:]
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Length", strconv.Itoa(len(remaining)))
+	w.WriteHeader(status)
+
+	if attempt > 1 {
+		_, _ = w.Write(remaining)
+		return
+	}
+
+	// the first attempt delivers a prefix and then says nothing more, holding the connection open
+	_, _ = w.Write(remaining[:s.stallAfter])
+	w.(http.Flusher).Flush()
+	<-s.release
+}
+
+func (s *stallingBlobServer) seenRanges() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ranges...)
+}
+
+// pacedBlobServer delivers the whole payload in small writes spaced apart, never pausing long
+// enough to be a stall. it guards the constant: a deadline that tracked slowness rather than
+// silence would abandon this transfer, which is exactly the reader the resume path exists for.
+type pacedBlobServer struct {
+	payload []byte
+	writes  int
+	gap     time.Duration
+
+	mu       sync.Mutex
+	attempts int
+}
+
+func (s *pacedBlobServer) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	s.attempts++
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Length", strconv.Itoa(len(s.payload)))
+	w.WriteHeader(http.StatusOK)
+
+	size := len(s.payload) / s.writes
+	for off := 0; off < len(s.payload); off += size {
+		end := min(off+size, len(s.payload))
+
+		_, _ = w.Write(s.payload[off:end])
+		w.(http.Flusher).Flush()
+		time.Sleep(s.gap)
+	}
+}
+
+func (s *pacedBlobServer) attemptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
 }
 
 func newTestClient(minSize int64) *http.Client {
@@ -792,6 +888,15 @@ func TestResumableTransport_shouldResume(t *testing.T) {
 			expected: true,
 		},
 		{
+			// http.Transport never returns (nil, nil), but newResumableTransport takes any
+			// RoundTripper, and a base that broke the contract used to panic here rather than
+			// simply not being wrapped
+			name:     "a nil response is left alone",
+			req:      get(""),
+			resp:     nil,
+			expected: false,
+		},
+		{
 			// the offsets are wire bytes, so an identity segment cannot be spliced onto a stream
 			// that arrived in some coding. net/http leaves an explicit one from the server in place
 			name:     "an encoded response is left alone",
@@ -820,7 +925,7 @@ func TestResumableTransport_shouldResume(t *testing.T) {
 		{
 			name:     "a caller's own range request is left alone",
 			req:      get("bytes=10-"),
-			resp:     response(http.StatusPartialContent, resumeMinSize),
+			resp:     response(http.StatusOK, resumeMinSize),
 			expected: false,
 		},
 		{
@@ -1079,6 +1184,7 @@ func TestResumableTransport_closeAbortsAReopenInFlight(t *testing.T) {
 
 	var once sync.Once
 	reopening := make(chan struct{})
+	release := make(chan struct{})
 	served := 0
 	var mu sync.Mutex
 
@@ -1096,10 +1202,12 @@ func TestResumableTransport_closeAbortsAReopenInFlight(t *testing.T) {
 			panic(http.ErrAbortHandler)
 		}
 
-		// accept the reopen and fall silent, never sending headers
+		// accept the reopen and fall silent, never sending headers. released at cleanup rather than
+		// blocked for ever, so the handler goroutine and the server both go away with the test
 		once.Do(func() { close(reopening) })
-		select {}
+		<-release
 	}))
+	t.Cleanup(func() { close(release); srv.Close() })
 
 	resp, err := newTestClient(1).Get(srv.URL)
 	require.NoError(t, err)
@@ -1149,4 +1257,912 @@ func TestResumableTransport_refusesASegmentLongerThanTheRangeItClaims(t *testing
 
 	// permanent, so it costs one attempt rather than the whole budget
 	assert.Len(t, server.seenRanges(), 2)
+}
+
+func TestResumableTransport_endsAReadThatStalls(t *testing.T) {
+	// the failure this bounds is a body that stops arriving while the connection stays open, so the
+	// server is never released until cleanup: if the watchdog does not end the read, nothing will
+	payload := payloadOfSize(64 * 1024)
+	server := &stallingBlobServer{payload: payload, stallAfter: 1024, release: make(chan struct{})}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(func() { close(server.release); srv.Close() })
+
+	transport := newTestTransport(1)
+	transport.stallTimeout = 100 * time.Millisecond
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	type result struct {
+		body []byte
+		err  error
+	}
+
+	// read on another goroutine and time out here: a regression in the watchdog leaves the read
+	// blocked for ever, and asserting on elapsed time after the fact cannot catch that -- the
+	// assertion is never reached. this way the test fails by name in a second instead of panicking
+	// at go test's ten minute default with a goroutine dump
+	done := make(chan result, 1)
+	go func() {
+		body, err := io.ReadAll(resp.Body)
+		done <- result{body: body, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		require.NoError(t, got.err)
+		assert.Equal(t, payload, got.body, "the stalled prefix should be spliced onto the resumed remainder")
+		assert.Equal(t, []string{"", "bytes=1024-65535"}, server.seenRanges(),
+			"the resume should ask for exactly the bytes the stalled attempt did not deliver")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the watchdog never ended the stalled read: the body is still blocked")
+	}
+}
+
+func TestResumableTransport_leavesASlowButAdvancingBodyAlone(t *testing.T) {
+	// guards the constant against being read as a clock on slowness: this body takes far longer than
+	// the stall timeout to arrive in total, but is never silent for as long as one
+	payload := payloadOfSize(32 * 1024)
+	server := &pacedBlobServer{payload: payload, writes: 16, gap: 5 * time.Millisecond}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(srv.Close)
+
+	transport := newTestTransport(1)
+	// a hundredfold margin rather than a fivefold one: at 5x, scheduling noise under -race fired the
+	// watchdog about once in ninety runs, and the resume then met a fixture that ignores Range and
+	// failed the test outright. what is being asserted is the ratio, so the absolute values are free
+	transport.stallTimeout = 500 * time.Millisecond
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, payload, got)
+	assert.Equal(t, 1, server.attemptCount(), "a body that keeps delivering should never be resumed")
+}
+
+func TestResumableTransport_stallDeadlineIsOffWhenUnset(t *testing.T) {
+	// the zero value of stallTimeout is the master switch: it turns off the first-byte budget with
+	// it, so a caller that wants no watchdog at all gets none rather than a minute-long one.
+	//
+	// the fixture pauses two hundred times longer than the first-byte budget it is given, so this
+	// test fails the moment that budget is armed at all -- which is what an earlier version of it
+	// could not do, since its server answered instantly and no budget was ever reached
+	payload := payloadOfSize(8192)
+	server := &pausingBlobServer{payload: payload, pause: 200 * time.Millisecond}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(srv.Close)
+
+	transport := newTestTransport(1)
+	transport.stallTimeout = 0
+	transport.firstByte = time.Millisecond
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, payload, got)
+	assert.Equal(t, 1, server.attemptCount(),
+		"with the watchdog off the pause should be waited out, not resumed around")
+}
+
+func TestResumableTransport_releasesTheContextOfAnUnwrappedBody(t *testing.T) {
+	// a response too small to wrap still carries a context minted by RoundTrip. closing its body has
+	// to release it, or every manifest fetch leaks one until the pull's own context is done
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("too small to wrap"))
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, err := newTestClient(1 << 20).Get(srv.URL)
+	require.NoError(t, err)
+
+	wrapped, ok := resp.Body.(*cancelOnClose)
+	require.True(t, ok, "an unwrapped body should still carry its cancel")
+
+	released := make(chan struct{})
+	original := wrapped.cancel
+	wrapped.cancel = func() { original(); close(released) }
+
+	require.NoError(t, resp.Body.Close())
+
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("closing the body should have released the context minted for it")
+	}
+}
+
+// clampingBlobServer honours every Range but answers with a self-consistent 206 far shorter than
+// the span asked for: Content-Range, Content-Length and the bytes written all agree, so the segment
+// is accepted and then ends in a bare io.EOF well short of the object. It is the shape a badly
+// configured mirror takes, and the only one that produces an io.EOF as the cause of a terminal
+// failure -- an ordinary truncation is reported by net/http as io.ErrUnexpectedEOF already.
+type clampingBlobServer struct {
+	payload []byte
+	clamp   int
+}
+
+func (s *clampingBlobServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := int64(0)
+	status := http.StatusOK
+
+	if spec := r.Header.Get("Range"); spec != "" {
+		var end int64
+		if _, err := fmt.Sscanf(spec, "bytes=%d-%d", &start, &end); err != nil {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		status = http.StatusPartialContent
+
+		sending := int64(s.clamp)
+		if start+sending > int64(len(s.payload)) {
+			sending = int64(len(s.payload)) - start
+		}
+
+		w.Header().Set("Content-Range",
+			fmt.Sprintf("bytes %d-%d/%d", start, start+sending-1, len(s.payload)))
+		w.Header().Set("Content-Length", strconv.FormatInt(sending, 10))
+		w.WriteHeader(status)
+		_, _ = w.Write(s.payload[start : start+sending])
+
+		return
+	}
+
+	// the first response declares the whole object and delivers a fraction of it
+	w.Header().Set("Content-Length", strconv.Itoa(len(s.payload)))
+	w.WriteHeader(status)
+	_, _ = w.Write(s.payload[:s.clamp])
+	w.(http.Flusher).Flush()
+}
+
+func TestResumableTransport_aFailedTransferIsNeverACleanEndOfStream(t *testing.T) {
+	// the sharpest edge this transport could leave: a caller testing errors.Is(err, io.EOF) to mean
+	// "the stream ended" would read a truncated layer as a complete one. file.IterateTar in this
+	// repo does exactly that test, so the terminal error must never carry io.EOF in its chain
+	payload := payloadOfSize(256 * 1024)
+	server := &clampingBlobServer{payload: payload, clamp: 4096}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(srv.Close)
+
+	resp, err := newTestClient(1).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	_, err = io.ReadAll(resp.Body)
+	require.Error(t, err, "a transfer that never completes must fail")
+
+	assert.NotErrorIs(t, err, io.EOF,
+		"a truncation must not be mistakable for a clean end of stream")
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF,
+		"it should be reported as the short read it is")
+}
+
+// pausingBlobServer writes its response headers at once and then waits before sending any body at
+// all, which is what a pull-through cache or a scanning proxy does on a cold object.
+type pausingBlobServer struct {
+	payload []byte
+	pause   time.Duration
+
+	mu       sync.Mutex
+	attempts int
+}
+
+func (s *pausingBlobServer) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	s.attempts++
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Length", strconv.Itoa(len(s.payload)))
+	w.WriteHeader(http.StatusOK)
+	w.(http.Flusher).Flush()
+
+	time.Sleep(s.pause)
+
+	_, _ = w.Write(s.payload)
+}
+
+func (s *pausingBlobServer) attemptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+func TestResumableTransport_allowsAGenerousFirstByte(t *testing.T) {
+	// time to first byte is a different thing from going quiet mid-body, and holding it to the
+	// mid-body budget would fail a pull that previously only ran slowly
+	payload := payloadOfSize(32 * 1024)
+	server := &pausingBlobServer{payload: payload, pause: 150 * time.Millisecond}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(srv.Close)
+
+	transport := newTestTransport(1)
+	transport.stallTimeout = 20 * time.Millisecond
+	transport.firstByte = 5 * time.Second
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, payload, got)
+	assert.Equal(t, 1, server.attemptCount(),
+		"a slow first byte should be waited for, not resumed around")
+}
+
+func TestResumableTransport_stillBoundsAFirstByteThatNeverArrives(t *testing.T) {
+	// the generous budget is still a budget: a server that sends headers and then nothing must not
+	// hold the reader for as long as the caller's context allows
+	payload := payloadOfSize(32 * 1024)
+	server := &stallingBlobServer{payload: payload, stallAfter: 0, release: make(chan struct{})}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(func() { close(server.release); srv.Close() })
+
+	transport := newTestTransport(1)
+	// only the first-byte budget is short, and the mid-body one is set well beyond the guard below,
+	// so a read governed by the wrong field never returns and the select fires. an earlier version
+	// used five seconds here, inside the guard, and so passed whichever field was consulted
+	transport.firstByte = 50 * time.Millisecond
+	transport.stallTimeout = 30 * time.Second
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	type result struct {
+		body []byte
+		err  error
+	}
+
+	done := make(chan result, 1)
+	go func() {
+		body, readErr := io.ReadAll(resp.Body)
+		done <- result{body: body, err: readErr}
+	}()
+
+	select {
+	case got := <-done:
+		// the second attempt is served in full by this fixture, so the read succeeds. the body is
+		// compared rather than discarded, so a resume that bounded the wait and then spliced the
+		// wrong bytes would not pass for a fix
+		require.NoError(t, got.err)
+		assert.Equal(t, payload, got.body)
+		assert.Equal(t, []string{"", ""}, server.seenRanges(),
+			"with nothing delivered there is no prefix to splice onto, so the restart carries no Range")
+	case <-time.After(10 * time.Second):
+		t.Fatal("a first byte that never arrived was never bounded")
+	}
+}
+
+// silentReopenServer serves a prefix and drops, then accepts every later connection without ever
+// writing response headers, which is what an endpoint that is up but wedged looks like.
+type silentReopenServer struct {
+	payload    []byte
+	firstBytes int
+	release    chan struct{}
+
+	mu       sync.Mutex
+	attempts int
+}
+
+func (s *silentReopenServer) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	s.mu.Unlock()
+
+	if attempt > 1 {
+		<-s.release
+		return
+	}
+
+	w.Header().Set("Content-Length", strconv.Itoa(len(s.payload)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(s.payload[:s.firstBytes])
+	w.(http.Flusher).Flush()
+	panic(http.ErrAbortHandler)
+}
+
+func TestResumableTransport_boundsAReopenThatNeverSendsHeaders(t *testing.T) {
+	// the header clock was a package constant until it became a field, which left this branch with
+	// no coverage at all and no way for an operator to shorten a thirty second wait per attempt
+	payload := payloadOfSize(64 * 1024)
+	server := &silentReopenServer{payload: payload, firstBytes: 1024, release: make(chan struct{})}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(func() { close(server.release); srv.Close() })
+
+	transport := newTestTransport(1)
+	transport.headerTimeout = 50 * time.Millisecond
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	done := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadAll(resp.Body)
+		done <- readErr
+	}()
+
+	select {
+	case readErr := <-done:
+		require.Error(t, readErr)
+		assert.Contains(t, readErr.Error(), "no response headers within",
+			"the failure should name the clock that ended it, not a bare cancellation")
+		assert.NotErrorIs(t, readErr, context.Canceled,
+			"our own timer must not reach the caller as a cancellation nobody asked for")
+	case <-time.After(30 * time.Second):
+		t.Fatal("a reopen that never sent headers was never bounded")
+	}
+}
+
+// acceptAndCloseListener serves one truncated blob over a raw socket and then answers every later
+// connection by reading the request and closing without a response. That is what a load balancer
+// or CDN edge whose backend pool has drained does, and net/http reports it to the caller of
+// RoundTrip as a bare io.EOF -- the second door into the terminal error, which httptest cannot
+// produce because it always writes a response.
+type acceptAndCloseListener struct {
+	listener net.Listener
+	payload  []byte
+	prefix   int
+
+	mu       sync.Mutex
+	attempts int
+}
+
+func newAcceptAndCloseListener(t *testing.T, payload []byte, prefix int) *acceptAndCloseListener {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	server := &acceptAndCloseListener{listener: listener, payload: payload, prefix: prefix}
+	go server.serve()
+
+	t.Cleanup(func() { _ = listener.Close() })
+
+	return server
+}
+
+func (s *acceptAndCloseListener) url() string {
+	return "http://" + s.listener.Addr().String() + "/blob"
+}
+
+func (s *acceptAndCloseListener) serve() {
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			return
+		}
+
+		go s.handle(conn)
+	}
+}
+
+func (s *acceptAndCloseListener) handle(conn net.Conn) {
+	defer conn.Close()
+
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	s.mu.Unlock()
+
+	// read the request line and headers, so the client has genuinely written its request
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil || line == "\r\n" {
+			break
+		}
+	}
+
+	if attempt > 1 {
+		// accept, read, and close with no response at all
+		return
+	}
+
+	fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", len(s.payload))
+	_, _ = conn.Write(s.payload[:s.prefix])
+}
+
+func TestResumableTransport_aReopenThatIsNeverAnsweredIsNotACleanEndOfStream(t *testing.T) {
+	// the sibling of aFailedTransferIsNeverACleanEndOfStream, and the door it does not cover: there
+	// the io.EOF comes from the body read, here it comes from RoundTrip itself. the invariant is the
+	// same and has to hold on both, or a caller testing errors.Is(err, io.EOF) reads a layer we
+	// failed to fetch as one that simply ended
+	payload := payloadOfSize(64 * 1024)
+	server := newAcceptAndCloseListener(t, payload, 1024)
+
+	transport := newTestTransport(1)
+	transport.headerTimeout = time.Second
+
+	resp, err := (&http.Client{Transport: transport}).Get(server.url())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	got, err := io.ReadAll(resp.Body)
+	require.Error(t, err, "a transfer whose every reopen goes unanswered must fail")
+
+	assert.Len(t, got, 1024, "the bytes that did arrive should still be handed over")
+	assert.NotErrorIs(t, err, io.EOF,
+		"a reopen that was never answered must not be mistakable for a clean end of stream")
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF,
+		"it should be reported as the short read it is")
+}
+
+func TestResumableTransport_endsAReadThatStallsOverHTTP2(t *testing.T) {
+	// the stall arrives through a different path in net/http on HTTP/2 than on HTTP/1.1, and every
+	// registry in the probe table serves HTTP/2. the suite had an HTTP/2 drop test but no stall one
+	payload := payloadOfSize(64 * 1024)
+	server := &stallingBlobServer{payload: payload, stallAfter: 1024, release: make(chan struct{})}
+
+	srv := httptest.NewUnstartedServer(server)
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(func() { close(server.release); srv.Close() })
+
+	transport := newResumableTransport(srv.Client().Transport)
+	transport.minSize = 1
+	transport.backoff = 0
+	transport.stallTimeout = 100 * time.Millisecond
+	transport.firstByte = 100 * time.Millisecond
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	require.Equal(t, "HTTP/2.0", resp.Proto, "the fixture must actually be serving HTTP/2")
+
+	type result struct {
+		body []byte
+		err  error
+	}
+
+	done := make(chan result, 1)
+	go func() {
+		body, readErr := io.ReadAll(resp.Body)
+		done <- result{body: body, err: readErr}
+	}()
+
+	select {
+	case got := <-done:
+		require.NoError(t, got.err)
+		assert.Equal(t, payload, got.body)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the watchdog never ended the stalled HTTP/2 read")
+	}
+}
+
+// shortThenErrTransport hands back a body whose single Read returns bytes AND an error together,
+// then honours ranges. net/http's own body does exactly this on a mid-stream drop, and no httptest
+// fixture can produce it: a handler that aborts yields (0, err) on the following read instead. The
+// bytes delivered alongside the error have already been counted into the offset, so a resume that
+// discards them silently truncates the stream.
+type shortThenErrTransport struct {
+	payload []byte
+	prefix  int
+
+	mu     sync.Mutex
+	served int
+}
+
+type shortThenErrBody struct {
+	data []byte
+	done bool
+}
+
+func (b *shortThenErrBody) Read(p []byte) (int, error) {
+	if b.done {
+		return 0, io.ErrUnexpectedEOF
+	}
+
+	b.done = true
+	n := copy(p, b.data)
+
+	return n, io.ErrUnexpectedEOF
+}
+
+func (b *shortThenErrBody) Close() error { return nil }
+
+func (t *shortThenErrTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	t.served++
+	first := t.served == 1
+	t.mu.Unlock()
+
+	header := http.Header{}
+
+	if first {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ContentLength: int64(len(t.payload)),
+			Header:        header,
+			Body:          &shortThenErrBody{data: t.payload[:t.prefix]},
+			Request:       req,
+		}, nil
+	}
+
+	var start, end int64
+	if _, err := fmt.Sscanf(req.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+		return nil, err
+	}
+
+	header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(t.payload)))
+
+	return &http.Response{
+		StatusCode:    http.StatusPartialContent,
+		ContentLength: end - start + 1,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(t.payload[start : end+1])),
+		Request:       req,
+	}, nil
+}
+
+func TestResumableTransport_keepsBytesDeliveredAlongsideTheErrorThatEndedThem(t *testing.T) {
+	// the realistic drop shape: a read that returns n > 0 and an error together. those bytes are
+	// already counted into the offset, so the resume continues past them -- if they were not also
+	// handed to the caller the stream would be short by exactly that much, with no error at all
+	payload := payloadOfSize(64 * 1024)
+	base := &shortThenErrTransport{payload: payload, prefix: 512}
+
+	transport := newResumableTransport(base)
+	transport.minSize = 1
+	transport.backoff = 0
+
+	resp, err := (&http.Client{Transport: transport}).Get("http://example.invalid/blob")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Len(t, got, len(payload), "no byte delivered before the error may be dropped")
+	assert.Equal(t, payload, got)
+}
+
+// perpetuallyStallingServer never sends a body byte on any attempt, so the read ends on the
+// watchdog every time and the terminal error is whatever the stall path decided to call it.
+type perpetuallyStallingServer struct {
+	payload []byte
+	release chan struct{}
+}
+
+func (s *perpetuallyStallingServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	length := len(s.payload)
+	status := http.StatusOK
+
+	if spec := r.Header.Get("Range"); spec != "" {
+		var start, end int64
+		if _, err := fmt.Sscanf(spec, "bytes=%d-%d", &start, &end); err == nil {
+			status = http.StatusPartialContent
+			length = int(end - start + 1)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(s.payload)))
+		}
+	}
+
+	w.Header().Set("Content-Length", strconv.Itoa(length))
+	w.WriteHeader(status)
+	w.(http.Flusher).Flush()
+	<-s.release
+}
+
+func TestResumableTransport_aStallIsReportedAsAStall(t *testing.T) {
+	// the watchdog ends a read by cancelling the request, and a cancellation left bare reaches the
+	// caller as context.Canceled -- a Ctrl-C nobody pressed, which syft and grype are entitled to
+	// treat as a user abort and swallow. the reopen path is asserted on elsewhere; this is the read
+	payload := payloadOfSize(64 * 1024)
+	server := &perpetuallyStallingServer{payload: payload, release: make(chan struct{})}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(func() { close(server.release); srv.Close() })
+
+	transport := newTestTransport(1)
+	transport.stallTimeout = 20 * time.Millisecond
+	transport.firstByte = 20 * time.Millisecond
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	done := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadAll(resp.Body)
+		done <- readErr
+	}()
+
+	select {
+	case readErr := <-done:
+		require.Error(t, readErr)
+		assert.ErrorIs(t, readErr, errReadStalled, "a server that says nothing has stalled")
+		assert.NotErrorIs(t, readErr, context.Canceled,
+			"the cancellation was ours, and must not read as the caller's")
+		assert.NotErrorIs(t, readErr, io.EOF)
+	case <-time.After(20 * time.Second):
+		t.Fatal("a body that never delivered anything was never abandoned")
+	}
+}
+
+// badRangeServer drops its first response mid-body and answers every resume with a Content-Range of
+// the test's choosing, which is how the shapes acceptable refuses are reached.
+type badRangeServer struct {
+	payload      []byte
+	prefix       int
+	contentRange string
+	// chunked omits Content-Length, which is the only thing that disables the span cross-check. a
+	// shape meant to be caught by one of the position checks has to get past that one first, or the
+	// test cannot tell which guard did the work
+	chunked bool
+
+	mu       sync.Mutex
+	attempts int
+}
+
+func (s *badRangeServer) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	s.attempts++
+	first := s.attempts == 1
+	s.mu.Unlock()
+
+	if first {
+		w.Header().Set("Content-Length", strconv.Itoa(len(s.payload)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(s.payload[:s.prefix])
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	}
+
+	remaining := s.payload[s.prefix:]
+	w.Header().Set("Content-Range", s.contentRange)
+
+	if !s.chunked {
+		w.Header().Set("Content-Length", strconv.Itoa(len(remaining)))
+	}
+
+	w.WriteHeader(http.StatusPartialContent)
+	_, _ = w.Write(remaining)
+}
+
+func TestResumableTransport_refusesAnUncheckableOrImpossibleContentRange(t *testing.T) {
+	payload := payloadOfSize(64 * 1024)
+	const prefix = 1024
+
+	tests := []struct {
+		name         string
+		contentRange string
+		chunked      bool
+		expected     error
+	}{
+		{
+			// RFC 9110 makes this malformed for a 206, and it is the one shape that switches off
+			// both the span check and the changed-object check at once
+			name:         "neither a last byte position nor a total",
+			contentRange: fmt.Sprintf("bytes %d-*/*", prefix),
+			expected:     errNoRangeSupport,
+		},
+		{
+			name:         "a segment that ends before it starts",
+			contentRange: fmt.Sprintf("bytes %d-%d/%d", prefix, prefix-10, len(payload)),
+			chunked:      true,
+			expected:     errNoRangeSupport,
+		},
+		{
+			name:         "a segment that ends past the last byte of the object",
+			contentRange: fmt.Sprintf("bytes %d-%d/%d", prefix, len(payload)+100, len(payload)),
+			chunked:      true,
+			expected:     errNoRangeSupport,
+		},
+		{
+			// diagnosed as the object changing rather than as a server that cannot do ranges, which
+			// is what an operator needs to read
+			// the end is past the object as well, so both the position check and the changed-object
+			// check fire. which one is reported is the whole point: an object that grew should be
+			// diagnosed as one, not as a server that cannot do ranges
+			name:         "a total that no longer matches the object the read began with",
+			contentRange: fmt.Sprintf("bytes %d-%d/%d", prefix, len(payload)*2-1, len(payload)*2),
+			expected:     errObjectChanged,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := &badRangeServer{
+				payload:      payload,
+				prefix:       prefix,
+				contentRange: test.contentRange,
+				chunked:      test.chunked,
+			}
+
+			srv := httptest.NewServer(server)
+			t.Cleanup(srv.Close)
+
+			resp, err := newTestClient(1).Get(srv.URL)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = resp.Body.Close() })
+
+			_, err = io.ReadAll(resp.Body)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, test.expected)
+			assert.NotErrorIs(t, err, io.EOF)
+		})
+	}
+}
+
+// noRangeServer stalls before its first byte and then, on every later attempt, answers with the
+// whole object and no regard for any Range header -- a server with no range support at all.
+type noRangeServer struct {
+	payload []byte
+	release chan struct{}
+	// restartLength, when set, is the length the restart declares and delivers instead of the whole
+	// object; restartCoding, when set, is a Content-Encoding it claims for the restarted body
+	restartLength int
+	restartCoding string
+
+	mu       sync.Mutex
+	attempts int
+	ranges   []string
+}
+
+func (s *noRangeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.attempts++
+	first := s.attempts == 1
+	s.ranges = append(s.ranges, r.Header.Get("Range"))
+	s.mu.Unlock()
+
+	body := s.payload
+	if !first && s.restartLength > 0 {
+		body = s.payload[:s.restartLength]
+	}
+
+	if !first && s.restartCoding != "" {
+		w.Header().Set("Content-Encoding", s.restartCoding)
+	}
+
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	w.(http.Flusher).Flush()
+
+	if first {
+		<-s.release
+		return
+	}
+
+	_, _ = w.Write(body)
+}
+
+func (s *noRangeServer) seenRanges() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ranges...)
+}
+
+func TestResumableTransport_restartsRatherThanRangesWhenNothingHasArrived(t *testing.T) {
+	// a stall before the first byte used to reopen with Range: bytes=0-N, which gains nothing --
+	// there is no prefix to splice onto -- while letting a server with no range support answer 200
+	// and be classified as permanently unable to resume, failing a layer that would have arrived
+	payload := payloadOfSize(64 * 1024)
+	server := &noRangeServer{payload: payload, release: make(chan struct{})}
+
+	srv := httptest.NewServer(server)
+	t.Cleanup(func() { close(server.release); srv.Close() })
+
+	transport := newTestTransport(1)
+	transport.firstByte = 50 * time.Millisecond
+	transport.stallTimeout = 30 * time.Second
+
+	resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	type result struct {
+		body []byte
+		err  error
+	}
+
+	done := make(chan result, 1)
+	go func() {
+		body, readErr := io.ReadAll(resp.Body)
+		done <- result{body: body, err: readErr}
+	}()
+
+	select {
+	case got := <-done:
+		require.NoError(t, got.err, "a server with no range support should still be restartable")
+		assert.Equal(t, payload, got.body)
+		assert.Equal(t, []string{"", ""}, server.seenRanges(),
+			"the restart must carry no Range, or this server answers 200 and is refused for ever")
+	case <-time.After(20 * time.Second):
+		t.Fatal("the restart never completed")
+	}
+}
+
+func Test_forLog(t *testing.T) {
+	// the only thing between a CDN-signed blob URL and an operator's log. both log sites and every
+	// error message route through it
+	parsed, err := url.Parse("https://cdn.example.com/v2/img/blobs/sha256:abc?sig=SECRET&se=2026-01-01")
+	require.NoError(t, err)
+
+	rendered := forLog(parsed)
+
+	assert.Equal(t, "cdn.example.com/v2/img/blobs/sha256:abc", rendered)
+	assert.NotContains(t, rendered, "SECRET", "a signed URL's credentials must never be rendered")
+	assert.NotContains(t, rendered, "?")
+}
+
+func TestResumableTransport_checksTheRestartedBodyItAccepts(t *testing.T) {
+	// the restart path skips the range checks because there is nothing to splice onto, which leaves
+	// two guards carrying it alone. neither had a test, and losing either to a refactor would hand
+	// the caller the wrong bytes on the one path with no digest above it to notice
+	payload := payloadOfSize(64 * 1024)
+
+	tests := []struct {
+		name     string
+		server   func(chan struct{}) *noRangeServer
+		expected error
+	}{
+		{
+			name: "a restart of a different length is refused",
+			server: func(release chan struct{}) *noRangeServer {
+				return &noRangeServer{payload: payload, release: release, restartLength: len(payload) / 2}
+			},
+			expected: errObjectChanged,
+		},
+		{
+			name: "a restart in a different coding is refused",
+			server: func(release chan struct{}) *noRangeServer {
+				return &noRangeServer{payload: payload, release: release, restartCoding: "gzip"}
+			},
+			expected: errNoRangeSupport,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			release := make(chan struct{})
+			server := test.server(release)
+
+			srv := httptest.NewServer(server)
+			t.Cleanup(func() { close(release); srv.Close() })
+
+			transport := newTestTransport(1)
+			transport.firstByte = 50 * time.Millisecond
+			transport.stallTimeout = 30 * time.Second
+
+			resp, err := (&http.Client{Transport: transport}).Get(srv.URL)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = resp.Body.Close() })
+
+			done := make(chan error, 1)
+			go func() {
+				_, readErr := io.ReadAll(resp.Body)
+				done <- readErr
+			}()
+
+			select {
+			case readErr := <-done:
+				require.Error(t, readErr)
+				assert.ErrorIs(t, readErr, test.expected)
+				assert.NotErrorIs(t, readErr, io.EOF,
+					"a refused restart is not a clean end of stream either")
+			case <-time.After(20 * time.Second):
+				t.Fatal("the refused restart never ended the read")
+			}
+		})
+	}
 }
